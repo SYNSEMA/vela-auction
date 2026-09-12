@@ -1,0 +1,25 @@
+# A sealed-bid auction on Vela (Horizen) as a recipe: the book lives in the enclave (app/app.syn,
+# built to build/app.wasm and deployed to Vela); the entry is the client for the other side of the
+# enclave (the seller, the bidders, an auditor), which today runs with the binary. This file only
+# says what the code cannot say about itself; the `require` blocks are the manifests of capabilities.
+
+name = "Sealed-bid auction on Vela"
+slug = "vela-auction"
+version = "0.1.0"
+kind = "worker"
+entry = "client/vela_client.syn"
+engine = "0.6"
+tagline = "A sealed-bid auction on Horizen's Vela, in Synsema: encrypted bids, matching inside the enclave, settlement from escrow; losing bids are never revealed."
+tagline_es = "Subasta de sobre cerrado en Vela (Horizen) con Synsema: pujas cifradas, matching dentro del enclave, liquidación desde el escrow; las pujas perdedoras nunca se revelan."
+tagline_pt = "Leilão de lance selado no Vela (Horizen) com Synsema: lances cifrados, casamento dentro do enclave, liquidação do escrow; lances perdedores nunca são revelados."
+
+[secrets]
+VELA_SECP_KEY = "secp256k1 key that signs the transactions and pays the fees (hex; Anvil #0 on the local devnet)"
+VELA_P521_KEY = "P-521 private key for the encrypted channel with the Executor (hex; `vela_client.syn -- keys` makes one)"
+
+[env]
+VELA_TOKEN = ""
+VELA_RPC_URL = "http://localhost:8545"
+VELA_AUTHORITY_URL = "http://localhost:8081"
+VELA_SUBGRAPH_URL = "http://localhost:8000/subgraphs/name/hcce"
+VELA_MAX_FEE = "100"

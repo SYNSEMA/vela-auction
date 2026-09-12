@@ -1,0 +1,328 @@
+-- vela_client.syn — the auction's client, on top of vela_lib.syn (the protocol as a module).
+-- Whoever holds VELA_SECP_KEY in .env is the caller: the seller, a bidder, anyone.
+--
+-- Configuration: .env next to this file (copy .env.example). Amounts are in TOKENS (a quantity of
+-- the asset as "1000", a total in the payment token as "0.9"); the client converts by text with each
+-- token's decimals() (`eth` = the native token, 18 decimals). A price is shown as payment per whole
+-- asset unit, computed from the (quantity, total) pair the enclave ranks by.
+--
+--   the public devnet (no Docker):
+--   synsema run vela_client.syn -- devnet [host]                       a token of your own from devnet.synsema.app, written to .env
+--   synsema run vela_client.syn -- allow-token <address>               TokenAllowlist.addAllowedToken with the signing key (the admin: Anvil #0 on a devnet)
+--   synsema run vela_client.syn -- allow-authority <appId> <address>   DefaultAuthority.addAllowedAuthority — an auditor for your app
+--
+--   the auction:
+--   synsema run vela_client.syn -- fund <eth|token> <tokens>           deposit into your balance in the app (approve first for an ERC-20)
+--   synsema run vela_client.syn -- open <asset> <quantity> <payment> [reserve total] [uniform|pay_as_bid]   the seller offers the block
+--   synsema run vela_client.syn -- bid <n> <quantity> <total>          a sealed bid: quantity of the asset for total of the payment token
+--   synsema run vela_client.syn -- cancel-bid <n>                      before the close
+--   synsema run vela_client.syn -- close <n> | cancel <n>              the seller
+--   synsema run vela_client.syn -- withdraw <eth|token> <tokens> [to]  from your balance, as a pull-payment (claim-for)
+--   synsema run vela_client.syn -- auctions [n]                        the public events: opened, cleared (what the chain knows)
+--   synsema run vela_client.syn -- results [n]                         your decrypted events: bids, results, cleared, deposits
+--   synsema run vela_client.syn -- audit ['<json>']                    the whole book (the caller must be an allowed authority)
+--   synsema run vela_client.syn -- pending <eth|token> <address> | claim-for <eth|token> <address> | token-balance <token> <address>
+--
+--   Vela, generic (the starter kit's commands):
+--   synsema run vela_client.syn -- keys | address | tee | user-keys | user
+--   synsema run vela_client.syn -- deploy <wasm> [params-json|-] [trigger] | register | deposit <amount> [token]
+--   synsema run vela_client.syn -- send '<json>' [wei] | report '<json>' | report-download <id> | events [n] | app-events [n] | status <id>
+--   synsema run vela_client.syn -- register-for | send-for '<json>' [amount token] | events-for [n]   (the facilitator: VELA_USER_KEY signs, VELA_SECP_KEY pays)
+intent: "vela client: a sealed-bid auction's seller, bidders and auditor — on top of the protocol module"
+
+require net("localhost")
+require net("127.0.0.1")
+require net("devnet.synsema.app")
+require env("VELA_*")
+require secret("VELA_*")
+require sign("VELA_SECP_KEY")
+require sign("VELA_USER_KEY")
+require random
+require time
+require file.read("*")
+require file.write(".env")
+require reveal("ecdh_keypair.private")
+
+use "./vela_lib.syn" as v
+
+let ETH be "0x0000000000000000000000000000000000000000"
+let PROCESS be 1
+let DEANONYMIZATION be 2
+let ASSOCIATE_KEY be 3
+
+task usage()
+    print("usage: synsema run vela_client.syn -- devnet [host] | allow-token <address> | allow-authority <appId> <address> | fund <eth|token> <tokens> | open <asset> <quantity> <payment> [reserve] [uniform|pay_as_bid] | bid <n> <quantity> <total> | cancel-bid <n> | close <n> | cancel <n> | withdraw <eth|token> <tokens> [to] | auctions [n] | results [n] | audit ['<json>'] | pending <eth|token> <address> | claim-for <eth|token> <address> | token-balance <token> <address> | keys | address | tee | user-keys | user | deploy <wasm> [params-json|-] [trigger] | register | deposit <amount> [token] | send '<json>' [wei] | report '<json>' | report-download <id> | events [n] | app-events [n] | status <id> | register-for | send-for '<json>' [amount token] | events-for [n]")
+
+task arg_or(a, i, default)
+    give when length(a) > i then a[i] otherwise default
+
+task has(list, x)
+    each item in list
+        when item == x
+            give true
+    give false
+
+-- `eth` or an address; ETH has 18 decimals, an ERC-20 says its own.
+task token_of(t)
+    give when lower(t) == "eth" then ETH otherwise lower(t)
+
+task decimals_of(c, token)
+    when token == ETH
+        give 18
+    give abi_decode("uint8", eth_call(c["rpc"], {"to": token, "data": abi_encode("decimals()", [])}))[0]
+
+task units(c, token, tokens)
+    give v.to_units(tokens, decimals_of(c, token))
+
+task human(c, token, u)
+    give v.from_units(u, decimals_of(c, token))
+
+task auction_id(t)
+    when starts_with(lower(t), "0x")
+        give lower(t)
+    give v.hex_of(int_to_bytes(v.int_of(t), 16))
+
+task encrypted(c, plain)
+    give v.seal(v.derive_key(v.p521_key(), v.tee_public_key(c)), bytes(json_encode(plain)))
+
+task instruct(c, plain)
+    let id be v.submit(c, PROCESS, encrypted(c, plain), ETH, 0)
+    print(plain["type"] + " submitted: " + id)
+    let row be v.wait_completed(c, id, false)
+    print("completed at block " + text(row["blockNumber"]) + ", fees " + text(row["applicationFees"]) + " wei")
+    give row
+
+-- The price a (quantity, total) pair means, as payment per whole asset unit, for people.
+task price_of(c, asset, payment, quantity, total)
+    let ad be decimals_of(c, asset)
+    let pd be decimals_of(c, payment)
+    -- total ÷ quantity × 10^ad, shown with pd decimals: exact integer arithmetic, then formatted
+    let scaled be v.int_of(total) * v.int_of(v.to_units("1", ad))
+    give v.from_units(text(v.div_floor(scaled, v.int_of(quantity))), pd)
+
+task print_events(c, items)
+    each item in items
+        when contains(item, "event") and contains(item["event"], "type")
+            print(json_encode(item["event"]))
+
+task run_cli(a)
+    when length(a) == 0
+        usage()
+        give nothing
+    let c be v.cfg()
+    match a[0]
+        is "devnet"
+            let host be arg_or(a, 1, "devnet.synsema.app")
+            let values be v.devnet_env(host)
+            v.env_write(".env", values)
+            each k in keys(values)
+                print(k + "=" + text(values[k]))
+            print("written to .env: a token of your own on " + host + " (the admin key there is Anvil #0; allow-token / allow-authority are yours to run)")
+        is "allow-token"
+            let receipt be v.allow_token(c, lower(a[1]))
+            print("token " + lower(a[1]) + " allowlisted (tx " + text(receipt["transactionHash"]) + ")")
+        is "allow-authority"
+            let receipt be v.allow_authority(c, v.int_of(a[1]), lower(a[2]))
+            print("authority " + lower(a[2]) + " allowed for app " + a[1] + " (tx " + text(receipt["transactionHash"]) + ")")
+        -- ---- the auction ----
+        is "fund"
+            let token be token_of(a[1])
+            let u be v.int_of(units(c, token, a[2]))
+            when token != ETH
+                v.approve(c, token, u)
+            let id be v.submit(c, PROCESS, bytes(""), token, u)
+            print("deposit submitted: " + id)
+            v.wait_completed(c, id, false)
+            print("funded " + a[2] + " of " + (when token == ETH then "ETH" otherwise token))
+        is "open"
+            let asset be token_of(a[1])
+            let payment be token_of(a[3])
+            let plain be {"type": "open", "asset": asset, "quantity": units(c, asset, a[2]), "payment": payment, "reserve": units(c, payment, arg_or(a, 4, "0")), "kind": arg_or(a, 5, "uniform")}
+            instruct(c, plain)
+            print_events(c, v.my_events(c, 1))
+        is "bid"
+            let id be auction_id(a[1])
+            let au be find_public(c, id)
+            when au == nothing
+                raise("auction " + a[1] + " not found among the public events; give its asset and payment: bid <n> <quantity> <total> <asset> <payment>")
+            let plain be {"type": "bid", "auction": id, "quantity": units(c, au["asset"], a[2]), "total": units(c, au["payment"], a[3])}
+            print("bidding " + a[2] + " of the asset for " + a[3] + " of the payment token: " + price_of(c, au["asset"], au["payment"], plain["quantity"], plain["total"]) + " per unit (sealed)")
+            instruct(c, plain)
+        is "cancel-bid"
+            instruct(c, {"type": "cancel_bid", "auction": auction_id(a[1])})
+        is "close"
+            instruct(c, {"type": "close", "auction": auction_id(a[1])})
+            print_events(c, v.my_events(c, 1))
+        is "cancel"
+            instruct(c, {"type": "cancel", "auction": auction_id(a[1])})
+        is "withdraw"
+            let token be token_of(a[1])
+            let plain be {"type": "withdraw", "token": token, "amount": units(c, token, a[2])}
+            when length(a) > 3
+                set plain["to"] to lower(a[3])
+            instruct(c, plain)
+            print("withdrawn " + a[2] + " to a pull-payment; claim it with `claim-for " + a[1] + " <address>`")
+        is "auctions"
+            each item in v.app_events(c, floor(number(arg_or(a, 1, "10"))))
+                print(json_encode(decode_public(c, item)))
+        is "results"
+            print_events(c, v.my_events(c, floor(number(arg_or(a, 1, "10")))))
+        is "audit"
+            let plain be json_decode(arg_or(a, 1, "{\"report_type\":\"audit\"}"))
+            let id be v.submit(c, DEANONYMIZATION, encrypted(c, plain), ETH, 0)
+            print("audit request submitted: " + id)
+            v.wait_completed(c, id, false)
+            print(json_encode(v.download_report(c, id)))
+        is "pending"
+            let token be token_of(a[1])
+            print(human(c, token, v.call_uint(c, v.need(c, "processor", "VELA_PROCESSOR"), "pendingClaims(address,address)", [token, a[2]])))
+        is "claim-for"
+            let token be token_of(a[1])
+            let receipt be v.send_tx(c, v.need(c, "processor", "VELA_PROCESSOR"), 0, abi_encode("claim(address,address)", [token, a[2]]))
+            print("claimed " + a[1] + " for " + a[2] + " (tx " + text(receipt["transactionHash"]) + ")")
+        is "token-balance"
+            let token be token_of(a[1])
+            print(human(c, token, v.token_balance_of(c, token, a[2])))
+        -- ---- Vela, generic ----
+        is "keys"
+            let kp be ecdh_keypair("P-521")
+            print("VELA_P521_KEY=" + decode(reveal(kp["private"]), "hex"))
+            print("VELA_P521_PUB=" + decode(kp["public"], "hex"))
+        is "address"
+            print(v.me())
+        is "tee"
+            print(v.hex_of(v.tee_public_key(c)))
+        is "user"
+            print(v.user_address())
+        is "user-keys"
+            let k be decode(random_bytes(32), "hex")
+            print("VELA_USER_KEY=" + k)
+            print("address " + eth_address(as_secret(k, "VELA_USER_KEY")))
+        is "deploy"
+            let params be when length(a) > 2 and a[2] != "-" then json_decode(a[2]) otherwise nothing
+            let trigger be arg_or(a, 3, nothing)
+            let ids be v.deploy(c, a[1], params, trigger)
+            print("deploy submitted: app " + text(ids["app_id"]) + ", request " + ids["request_id"])
+            let row be v.wait_completed(c, ids["request_id"], true)
+            print("deploy completed at block " + text(row["blockNumber"]) + " — put VELA_APP_ID=" + text(ids["app_id"]) + " in .env")
+        is "register"
+            let id be v.submit(c, ASSOCIATE_KEY, v.register_payload(c), ETH, 0)
+            print("register submitted: " + id)
+            v.wait_completed(c, id, false)
+            print("registered " + v.me() + " with a privacy seed (50 subtypes)")
+        is "deposit"
+            let token be lower(arg_or(a, 2, ETH))
+            let amount be v.int_of(a[1])
+            when token != ETH
+                v.approve(c, token, amount)
+            let id be v.submit(c, PROCESS, bytes(""), token, amount)
+            print("deposit submitted: " + id)
+            v.wait_completed(c, id, false)
+            print("deposit completed" + (when token == ETH then "" otherwise " (" + token + ")"))
+        is "send"
+            let plain be json_decode(a[1])
+            let wei be when length(a) > 2 then v.int_of(a[2]) otherwise 0
+            let id be v.submit(c, PROCESS, encrypted(c, plain), ETH, wei)
+            print("request submitted: " + id)
+            let row be v.wait_completed(c, id, false)
+            print("completed at block " + text(row["blockNumber"]) + ", fees " + text(row["applicationFees"]) + " wei")
+        is "report"
+            let plain be json_decode(arg_or(a, 1, "{}"))
+            let id be v.submit(c, DEANONYMIZATION, encrypted(c, plain), ETH, 0)
+            print("report request submitted: " + id)
+            v.wait_completed(c, id, false)
+            print("report generated: " + v.need(c, "app_id", "VELA_APP_ID") + "_" + slice(id, 2, length(id)))
+            print(json_encode(v.download_report(c, id)))
+        is "report-download"
+            print(json_encode(v.download_report(c, a[1])))
+        is "events"
+            each item in v.my_events(c, floor(number(arg_or(a, 1, "10"))))
+                print(json_encode(item))
+        is "app-events"
+            each item in v.app_events(c, floor(number(arg_or(a, 1, "10"))))
+                print(json_encode(item))
+        is "status"
+            let row be v.completion(c, lower(a[1]), false)
+            when row == nothing
+                set row to v.completion(c, lower(a[1]), true)
+            print(when row == nothing then "pending (not completed yet)" otherwise json_encode(row))
+        is "register-for"
+            let id be v.submit_for(c, ASSOCIATE_KEY, v.register_payload_for(c), ETH, 0)
+            print("register submitted by the facilitator: " + id)
+            v.wait_completed(c, id, false)
+            print("registered " + v.user_address() + " (the user paid nothing)")
+        is "send-for"
+            let plain be json_decode(a[1])
+            let amount be when length(a) > 2 then v.int_of(a[2]) otherwise 0
+            let token be lower(arg_or(a, 3, ETH))
+            let id be v.submit_for(c, PROCESS, encrypted(c, plain), token, amount)
+            print("request submitted by the facilitator for " + v.user_address() + ": " + id)
+            let row be v.wait_completed(c, id, false)
+            print("completed at block " + text(row["blockNumber"]) + ", fees " + text(row["applicationFees"]) + " wei (paid by the facilitator)")
+        is "events-for"
+            each item in v.events_for(c, floor(number(arg_or(a, 1, "10"))))
+                print(json_encode(item))
+        otherwise
+            usage()
+
+-- The public events, decoded: `opened` (id, asset, quantity, payment, kind) and `cleared`
+-- (id, sold, proceeds, kind) — what anyone can read from the chain.
+task decode_public(c, item)
+    let out be {"request_id": item["request_id"], "block": item["block"], "label": item["label"]}
+    try
+        let data be v.hex_bytes(item["data"])
+        when item["label"] == "opened"
+            let d be abi_decode("(bytes16,address,uint256,address,uint8)", data)
+            set out["auction"] to {"id": v.hex_of(d[0]), "n": bytes_to_int(d[0]), "asset": lower(d[1]), "quantity": text(d[2]), "payment": lower(d[3]), "kind": when d[4] == 0 then "uniform" otherwise "pay_as_bid"}
+        when item["label"] == "cleared"
+            let d be abi_decode("(bytes16,uint256,uint256,uint8)", data)
+            set out["result"] to {"id": v.hex_of(d[0]), "n": bytes_to_int(d[0]), "sold": text(d[1]), "proceeds": text(d[2]), "kind": when d[3] == 0 then "uniform" otherwise "pay_as_bid"}
+    recover err
+        set out["error"] to text(err)
+    give out
+
+-- An auction's asset and payment token, from its public `opened` event.
+task find_public(c, id)
+    each item in v.app_events(c, 50)
+        when item["label"] == "opened"
+            let d be decode_public(c, item)
+            when contains(d, "auction") and d["auction"]["id"] == id
+                give d["auction"]
+    give nothing
+
+run_cli(args())
+
+-- ---------------------------------------------------------------------------------------
+-- Tests (pure: no chain, no network): `synsema test vela_client.syn`
+-- ---------------------------------------------------------------------------------------
+
+test "decimal text becomes an exact integer beyond 2^53"
+    assert_eq(text(v.int_of("9105241052143571847")), "9105241052143571847")
+    assert_eq(v.int_of("0"), 0)
+
+test "a payload round-trips through the Executor's cipher (P-521 ECDH → HKDF → AES-256-GCM)"
+    let user be ecdh_keypair("P-521")
+    let tee be ecdh_keypair("P-521")
+    let k_user be v.derive_key(user["private"], tee["public"])
+    let k_tee be v.derive_key(tee["private"], user["public"])
+    let blob be v.seal(k_user, bytes("{\"type\":\"bid\"}"))
+    assert_eq(decode(v.open(k_tee, blob)), "{\"type\":\"bid\"}")
+
+test "the seed is a 65-byte signature and yields 50 distinct 32-byte subtypes"
+    let k be as_secret("ac0974bec39a17e36ba4a6b4d238ff944bacb478cbed5efcae784d7bf4f2ff80", "VELA_SECP_KEY")
+    let subs be v.subtypes(v.seed_of(k))
+    assert_eq(length(subs), 50)
+    assert_eq(length(unique(subs)), 50)
+
+test "an auction is named by number or id; tokens by `eth` or address"
+    assert_eq(auction_id("1"), "0x00000000000000000000000000000001")
+    assert_eq(auction_id("0x000000000000000000000000000000FF"), "0x000000000000000000000000000000ff")
+    assert_eq(token_of("eth"), ETH)
+    assert_eq(token_of("0xA0B86991C6218B36C1D19D4A2E9EB0CE3606EB48"), "0xa0b86991c6218b36c1d19d4a2e9eb0ce3606eb48")
+
+test "human amounts become exact token units and back; exact division at any size"
+    assert_eq(v.to_units("0.9", 18), "900000000000000000")
+    assert_eq(v.to_units("1000", 6), "1000000000")
+    assert_eq(v.from_units("600000000000000000", 18), "0.600000000000000000")
+    assert_eq(v.div_floor(600000000 * 600000000000000000, 600000000), 600000000000000000)
+    assert_eq(v.div_floor(10, 3), 3)

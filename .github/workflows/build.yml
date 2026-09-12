@@ -1,0 +1,45 @@
+# Tests the app and the client natively, builds the Vela guest from app/app.syn (the
+# release's guest module + your program, no compiler), probes it the way the Executor drives it
+# (Node 24 WASI and wasmtime-go v1.0.0), and publishes build/app.wasm as a downloadable artifact.
+name: auction guest
+
+on: [push, pull_request, workflow_dispatch]
+
+env:
+  SYNSEMA_TAG: v0.6.23
+  # The Go probe sends a process_request; set repository variables if your app's instructions differ.
+  DEPLOY_PARAMS: ${{ vars.VELA_DEPLOY_PARAMS || '' }}
+  PAYLOAD: ${{ vars.VELA_SMOKE_PAYLOAD || '{"type":"withdraw","token":"0x0000000000000000000000000000000000000000","amount":"1"}' }}
+
+jobs:
+  guest:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "24"
+      - name: Install the released Synsema binary
+        run: npm i -g synsema@${SYNSEMA_TAG#v} && synsema version
+      - name: Test the app and the client natively
+        run: |
+          synsema test app/app.syn
+          (cd client && synsema test vela_client.syn)
+          synsema test scripts/embed.syn
+      - name: Build the guest (the release's module + app/app.syn)
+        run: sh scripts/build.sh
+      - name: Smoke under Node WASI (imports, exports, load_module, deploy, determinism)
+        run: node scripts/smoke.mjs build/app.wasm
+      - uses: actions/setup-go@v5
+        with:
+          go-version: "1.22"
+      - name: Probe under wasmtime-go v1.0.0 (the Executor's runtime)
+        run: |
+          git clone -q --depth 1 --branch "$SYNSEMA_TAG" https://github.com/kitecosmic/synsema.git .synsema/src
+          cd .synsema/src/packages/guests/vela/tests/wasmtime-go && go run . "$GITHUB_WORKSPACE/build/app.wasm"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: app.wasm
+          path: |
+            build/app.wasm
+            build/app.wasm.sha256

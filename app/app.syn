@@ -1,0 +1,535 @@
+-- Sealed-bid auction on Vela: a seller offers a block of one token for another (an OTC block, a
+-- token sale, a treasury bill); bidders deposit the payment token and send their bids ENCRYPTED to
+-- the enclave; nobody — not the other bidders, not the seller — sees a bid before the close; the
+-- matching runs inside, deterministically; winners and losers are settled from their escrow, and
+-- the losing bids are never revealed to anyone. The chain sees that an auction opened and what it
+-- cleared at, never who bid what. This file is the WHOLE application: it is embedded into the
+-- guest module (`scripts/build.sh` → build/app.wasm), so the SHA-256 Vela verifies covers it.
+--
+-- Entry points (one map in, one map out; see https://synsema.dev/en/0.6.x/73-vela):
+--   deploy(ctx)       no params
+--   deposit(ctx)      ETH or any allowlisted ERC-20; credits the sender's balance in that token
+--   process(ctx)      {"type": "open", "asset", "quantity", "payment", "reserve"?, "kind"?: "uniform" | "pay_as_bid"}   the seller
+--                     {"type": "bid", "auction", "quantity", "total"}          a bidder: `quantity` of the asset for `total` of the payment token
+--                     {"type": "cancel_bid", "auction"}                         a bidder, before the close
+--                     {"type": "close", "auction"} · {"type": "cancel", "auction"}   the seller
+--                     {"type": "withdraw", "token", "amount", "to"?}            anyone, from their balance (a pull-payment)
+--   deanonymize(ctx)  {"report_type"?: "audit" | "auction", "auction"?}       an allowed authority: the whole book
+--
+-- Amounts are the token's smallest unit as decimal TEXT. A price is never a float: a bid is a
+-- (quantity, total) pair, bids are ranked by cross-multiplication, and a partial fill pays
+-- floor(filled × total ÷ quantity) with exact integer arithmetic. `reserve` is the least total the
+-- seller accepts for the whole quantity (a price floor). Uniform price: every winner pays the price
+-- of the lowest accepted bid; pay-as-bid: each pays its own. No clock, no randomness: the seller
+-- closes. Test natively before building: `synsema test app/app.syn`.
+intent: "vela app: sealed-bid auction — encrypted bids, matching inside the enclave, settlement from escrow"
+
+let ETH be "0x0000000000000000000000000000000000000000"
+let MAX_BIDS be 200
+let MAX_CLOSED be 100
+
+task hex_of(b)
+    give "0x" + decode(b, "hex")
+
+task hex_bytes(h)
+    give bytes(slice(h, 2, length(h)), "hex")
+
+task is_address(a)
+    give a != nothing and starts_with(lower(text(a)), "0x") and length(text(a)) == 42 and matches(slice(text(a), 2, 42), "[0-9a-fA-F]+")
+
+task field(m, key, default)
+    when m != nothing and contains(m, key) and m[key] != nothing
+        give m[key]
+    give default
+
+-- Decimal text → integer, exactly (integers multiply and compare at any size; `/` does not).
+task int_of(t)
+    let s be trim(text(t))
+    when s == "" or not matches(s, "[0-9]+")
+        raise("not an amount: " + s)
+    let n be 0
+    each ch in split(s, "")
+        set n to n * 10 + floor(number(ch))
+    give n
+
+-- floor(a ÷ b) for integers of any size: schoolbook long division, digit by digit, with nothing
+-- but multiplications, additions and comparisons (which are exact).
+task div_floor(a, b)
+    when b <= 0
+        raise("division by zero")
+    when a < b
+        give 0
+    let r be 0
+    let q be 0
+    each ch in split(text(a), "")
+        set r to r * 10 + floor(number(ch))
+        let k be 0
+        while k < 9 and (k + 1) * b <= r
+            set k to k + 1
+        set r to r - k * b
+        set q to q * 10 + k
+    give q
+
+task min(a, b)
+    give when a < b then a otherwise b
+
+-- ---- state ----
+
+task new_state(app_id)
+    give {"app_id": app_id, "balances": {}, "auctions": {}, "auction_nonce": 0, "nonce": 0}
+
+task balance_of(state, account, token)
+    when contains(state["balances"], account) and contains(state["balances"][account], token)
+        give int_of(state["balances"][account][token])
+    give 0
+
+task set_balance(state, account, token, amount)
+    let balances be state["balances"]
+    let mine be when contains(balances, account) then balances[account] otherwise {}
+    set mine[token] to text(amount)
+    set balances[account] to mine
+    set state["balances"] to balances
+    give state
+
+task credit(state, account, token, amount)
+    give set_balance(state, account, token, balance_of(state, account, token) + amount)
+
+task bump(state)
+    set state["nonce"] to state["nonce"] + 1
+    give state
+
+task find_auction(state, p)
+    let id be field(p, "auction", nothing)
+    when id == nothing or not contains(state["auctions"], lower(text(id)))
+        give nothing
+    give state["auctions"][lower(text(id))]
+
+task save_auction(state, a)
+    let auctions be state["auctions"]
+    set auctions[a["id"]] to a
+    set state["auctions"] to auctions
+    give state
+
+task public_auction(a)
+    give {"id": a["id"], "n": a["n"], "asset": a["asset"], "quantity": a["quantity"], "payment": a["payment"], "reserve": a["reserve"], "kind": a["kind"], "status": a["status"]}
+
+-- ---- entry points ----
+
+task deploy(ctx)
+    give {"state": new_state(ctx["app_id"]), "fuel": "5"}
+
+task load_module(ctx)
+    give {"state": new_state(ctx["app_id"]), "fuel": "5"}
+
+task deposit(ctx)
+    let token be lower(ctx["token"])
+    let amount be int_of(ctx["value"])
+    let s1 be bump(credit(ctx["state"], ctx["sender"], token, amount))
+    let event be {"type": "deposit", "token": token, "amount": text(amount), "balance": text(balance_of(s1, ctx["sender"], token)), "nonce": s1["nonce"]}
+    give {"state": s1, "events": [{"user": ctx["sender"], "data": event}], "fuel": "35"}
+
+task process(ctx)
+    let payload be ctx["payload"]
+    when payload == nothing or not contains(payload, "type")
+        give {"error": "payload needs a \"type\": open | bid | cancel_bid | close | cancel | withdraw"}
+    match payload["type"]
+        is "open"
+            give open(ctx, ctx["state"], payload)
+        is "bid"
+            give bid(ctx, ctx["state"], payload)
+        is "cancel_bid"
+            give cancel_bid(ctx, ctx["state"], payload)
+        is "close"
+            give close(ctx, ctx["state"], payload)
+        is "cancel"
+            give cancel(ctx, ctx["state"], payload)
+        is "withdraw"
+            give withdraw(ctx, ctx["state"], payload)
+        otherwise
+            give {"error": "unsupported instruction type: " + text(payload["type"])}
+
+-- The seller locks `quantity` of the asset and opens the book. The chain learns that an auction
+-- opened (asset, quantity, payment token, kind) — not who sells.
+task open(ctx, state, p)
+    when not is_address(field(p, "asset", nothing)) or not is_address(field(p, "payment", nothing))
+        give {"error": "open needs the asset and the payment token addresses"}
+    let asset be lower(p["asset"])
+    let payment be lower(p["payment"])
+    when asset == payment
+        give {"error": "the asset and the payment token must differ"}
+    let quantity be int_of(field(p, "quantity", "0"))
+    when quantity <= 0
+        give {"error": "quantity must be positive"}
+    let reserve be int_of(field(p, "reserve", "0"))
+    let kind be text(field(p, "kind", "uniform"))
+    when kind != "uniform" and kind != "pay_as_bid"
+        give {"error": "kind must be uniform or pay_as_bid"}
+    let seller be ctx["sender"]
+    let have be balance_of(state, seller, asset)
+    when have < quantity
+        give {"error": "the seller holds " + text(have) + " of the asset, the auction needs " + text(quantity)}
+    let s0 be prune(state)
+    let n be s0["auction_nonce"] + 1
+    set s0["auction_nonce"] to n
+    let id be hex_of(int_to_bytes(n, 16))
+    let a be {"id": id, "n": n, "seller": seller, "asset": asset, "quantity": text(quantity), "payment": payment, "reserve": text(reserve), "kind": kind, "status": "open", "bids": {}, "bid_nonce": 0, "result": nothing}
+    let s1 be bump(save_auction(set_balance(s0, seller, asset, have - quantity), a))
+    let kind_code be when kind == "uniform" then 0 otherwise 1
+    let call be abi_encode("opened(bytes16,address,uint256,address,uint8)", [int_to_bytes(n, 16), asset, quantity, payment, kind_code])
+    let event be {"type": "opened", "auction": public_auction(a), "nonce": s1["nonce"]}
+    give {"state": s1, "events": [{"user": seller, "data": event}], "app_events": [{"subtype": "opened", "data_hex": hex_of(slice(call, 4, length(call)))}], "fuel": "50"}
+
+-- A bid: `quantity` of the asset for `total` of the payment token, escrowed from the bidder's
+-- balance until the close. One live bid per bidder per auction: a new one replaces the old.
+task bid(ctx, state, p)
+    let a be find_auction(state, p)
+    when a == nothing
+        give {"error": "unknown auction " + text(field(p, "auction", ""))}
+    when a["status"] != "open"
+        give {"error": "auction " + a["id"] + " is " + a["status"]}
+    let bidder be ctx["sender"]
+    when bidder == a["seller"]
+        give {"error": "the seller cannot bid"}
+    let quantity be int_of(field(p, "quantity", "0"))
+    let total be int_of(field(p, "total", "0"))
+    when quantity <= 0 or total <= 0
+        give {"error": "quantity and total must be positive"}
+    when quantity > int_of(a["quantity"])
+        give {"error": "the auction offers " + a["quantity"] + ", the bid asks " + text(quantity)}
+    let bids be a["bids"]
+    let s0 be state
+    when contains(bids, bidder)
+        set s0 to credit(s0, bidder, a["payment"], int_of(bids[bidder]["total"]))
+    when not contains(bids, bidder) and length(keys(bids)) >= MAX_BIDS
+        give {"error": "the book is full (" + text(MAX_BIDS) + " bids)"}
+    let have be balance_of(s0, bidder, a["payment"])
+    when have < total
+        give {"error": "the bidder holds " + text(have) + " of the payment token, the bid needs " + text(total)}
+    let s1 be set_balance(s0, bidder, a["payment"], have - total)
+    set a["bid_nonce"] to a["bid_nonce"] + 1
+    set bids[bidder] to {"quantity": text(quantity), "total": text(total), "n": a["bid_nonce"]}
+    set a["bids"] to bids
+    let s2 be bump(save_auction(s1, a))
+    let event be {"type": "bid", "auction": a["id"], "quantity": text(quantity), "total": text(total), "escrowed": text(total), "nonce": s2["nonce"]}
+    give {"state": s2, "events": [{"user": bidder, "data": event}], "fuel": "50"}
+
+task cancel_bid(ctx, state, p)
+    let a be find_auction(state, p)
+    when a == nothing
+        give {"error": "unknown auction " + text(field(p, "auction", ""))}
+    when a["status"] != "open"
+        give {"error": "auction " + a["id"] + " is " + a["status"]}
+    let bidder be ctx["sender"]
+    when not contains(a["bids"], bidder)
+        give {"error": "no bid of yours in auction " + a["id"]}
+    let total be int_of(a["bids"][bidder]["total"])
+    let kept be {}
+    each k in keys(a["bids"])
+        when k != bidder
+            set kept[k] to a["bids"][k]
+    set a["bids"] to kept
+    let s1 be bump(save_auction(credit(state, bidder, a["payment"], total), a))
+    let event be {"type": "bid_cancelled", "auction": a["id"], "refunded": text(total), "nonce": s1["nonce"]}
+    give {"state": s1, "events": [{"user": bidder, "data": event}], "fuel": "35"}
+
+-- Better bid first: a higher price (total ÷ quantity, compared by cross-multiplication), then the
+-- earlier one. Insertion sort: the book is small and the order must be the same everywhere.
+task better(x, y)
+    let px be int_of(x["total"]) * int_of(y["quantity"])
+    let py be int_of(y["total"]) * int_of(x["quantity"])
+    when px != py
+        give px > py
+    give x["n"] < y["n"]
+
+task ranked(bids)
+    let out be []
+    each bidder in keys(bids)
+        let b be bids[bidder]
+        set b["bidder"] to bidder
+        let placed be false
+        let next be []
+        each item in out
+            when not placed and better(b, item)
+                set next to append(next, b)
+                set placed to true
+            set next to append(next, item)
+        when not placed
+            set next to append(next, b)
+        set out to next
+    give out
+
+task above_reserve(a, b)
+    -- reserve is a total for the whole quantity: price floor = reserve ÷ quantity
+    give int_of(b["total"]) * int_of(a["quantity"]) >= int_of(a["reserve"]) * int_of(b["quantity"])
+
+-- The close: matching, settlement from escrow, one encrypted result per bidder, the seller's
+-- summary, and a public receipt with the clearing (never with who bid what).
+task close(ctx, state, p)
+    let a be find_auction(state, p)
+    when a == nothing
+        give {"error": "unknown auction " + text(field(p, "auction", ""))}
+    when ctx["sender"] != a["seller"]
+        give {"error": "only the seller closes"}
+    when a["status"] != "open"
+        give {"error": "auction " + a["id"] + " is " + a["status"]}
+    let order be ranked(a["bids"])
+    let remaining be int_of(a["quantity"])
+    let fills be []
+    let clearing be nothing
+    each b in order
+        when remaining > 0 and above_reserve(a, b)
+            let filled be min(int_of(b["quantity"]), remaining)
+            set remaining to remaining - filled
+            set fills to append(fills, {"bidder": b["bidder"], "filled": filled, "bid": b})
+            set clearing to b
+    let s1 be state
+    let proceeds be 0
+    let events be []
+    let results be []
+    each b in order
+        let filled be 0
+        let paid be 0
+        each f in fills
+            when f["bidder"] == b["bidder"]
+                set filled to f["filled"]
+                let ref be when a["kind"] == "uniform" then clearing otherwise b
+                set paid to div_floor(filled * int_of(ref["total"]), int_of(ref["quantity"]))
+        let refund be int_of(b["total"]) - paid
+        set s1 to credit(s1, b["bidder"], a["payment"], refund)
+        when filled > 0
+            set s1 to credit(s1, b["bidder"], a["asset"], filled)
+        set proceeds to proceeds + paid
+        set results to append(results, {"bidder": b["bidder"], "filled": text(filled), "paid": text(paid)})
+        set events to append(events, {"user": b["bidder"], "data": {"type": "result", "auction": a["id"], "n": a["n"], "filled": text(filled), "paid": text(paid), "refunded": text(refund), "clearing": when clearing == nothing then nothing otherwise {"quantity": clearing["quantity"], "total": clearing["total"]}}})
+    let sold be int_of(a["quantity"]) - remaining
+    set s1 to credit(s1, a["seller"], a["payment"], proceeds)
+    when remaining > 0
+        set s1 to credit(s1, a["seller"], a["asset"], remaining)
+    set a["status"] to "closed"
+    set a["result"] to {"sold": text(sold), "proceeds": text(proceeds), "clearing": when clearing == nothing then nothing otherwise {"quantity": clearing["quantity"], "total": clearing["total"]}, "fills": results}
+    let s2 be bump(save_auction(s1, a))
+    set events to append(events, {"user": a["seller"], "data": {"type": "cleared", "auction": a["id"], "n": a["n"], "sold": text(sold), "unsold": text(remaining), "proceeds": text(proceeds), "fills": results, "nonce": s2["nonce"]}})
+    let kind_code be when a["kind"] == "uniform" then 0 otherwise 1
+    let call be abi_encode("cleared(bytes16,uint256,uint256,uint8)", [int_to_bytes(a["n"], 16), sold, proceeds, kind_code])
+    give {"state": s2, "events": events, "app_events": [{"subtype": "cleared", "data_hex": hex_of(slice(call, 4, length(call)))}], "fuel": "80"}
+
+-- The seller withdraws the offer: every bid goes back to its bidder, the asset to the seller.
+task cancel(ctx, state, p)
+    let a be find_auction(state, p)
+    when a == nothing
+        give {"error": "unknown auction " + text(field(p, "auction", ""))}
+    when ctx["sender"] != a["seller"]
+        give {"error": "only the seller cancels"}
+    when a["status"] != "open"
+        give {"error": "auction " + a["id"] + " is " + a["status"]}
+    let s1 be credit(state, a["seller"], a["asset"], int_of(a["quantity"]))
+    let events be []
+    each bidder in keys(a["bids"])
+        set s1 to credit(s1, bidder, a["payment"], int_of(a["bids"][bidder]["total"]))
+        set events to append(events, {"user": bidder, "data": {"type": "result", "auction": a["id"], "n": a["n"], "filled": "0", "paid": "0", "refunded": a["bids"][bidder]["total"], "cancelled": true}})
+    set a["status"] to "cancelled"
+    let s2 be bump(save_auction(s1, a))
+    set events to append(events, {"user": a["seller"], "data": {"type": "cancelled", "auction": a["id"], "n": a["n"], "nonce": s2["nonce"]}})
+    give {"state": s2, "events": events, "fuel": "50"}
+
+task withdraw(ctx, state, p)
+    when not is_address(field(p, "token", nothing))
+        give {"error": "withdraw needs a token address"}
+    let token be lower(p["token"])
+    let amount be int_of(field(p, "amount", "0"))
+    when amount <= 0
+        give {"error": "amounts must be positive"}
+    let have be balance_of(state, ctx["sender"], token)
+    when have < amount
+        give {"error": "insufficient balance: " + text(have) + " < " + text(amount)}
+    let dest be lower(text(field(p, "to", ctx["sender"])))
+    when not is_address(dest)
+        give {"error": "invalid destination address " + dest}
+    let s1 be bump(set_balance(state, ctx["sender"], token, have - amount))
+    let event be {"type": "withdrawal", "token": token, "to": dest, "amount": text(amount), "balance": text(have - amount), "nonce": s1["nonce"]}
+    give {"state": s1, "events": [{"user": ctx["sender"], "data": event}], "withdrawals": [{"token": token, "to": dest, "amount": text(amount)}], "fuel": "50"}
+
+-- Past MAX_CLOSED finished auctions, the oldest go (open ones never do).
+task prune(state)
+    let closed be 0
+    each k in keys(state["auctions"])
+        when state["auctions"][k]["status"] != "open"
+            set closed to closed + 1
+    when closed <= MAX_CLOSED
+        give state
+    let kept be {}
+    let dropped be 0
+    each k in keys(state["auctions"])
+        let a be state["auctions"][k]
+        when a["status"] != "open" and dropped < closed - MAX_CLOSED
+            set dropped to dropped + 1
+        otherwise
+            set kept[k] to a
+    set state["auctions"] to kept
+    give state
+
+-- The authority's view: the whole book, bids included.
+task deanonymize(ctx)
+    let state be ctx["state"]
+    let payload be ctx["payload"]
+    let report_type be text(field(payload, "report_type", "audit"))
+    match report_type
+        is "audit"
+            give {"report": {"balances": state["balances"], "auctions": state["auctions"]}, "fuel": "20"}
+        is "auction"
+            let a be find_auction(state, payload)
+            when a == nothing
+                give {"error": "unknown auction " + text(field(payload, "auction", ""))}
+            give {"report": a, "fuel": "20"}
+        otherwise
+            give {"error": "unsupported report type: " + report_type}
+
+-- ---------------------------------------------------------------------------------------
+-- Tests: `synsema test app/app.syn`. The same code runs inside the enclave. Maps are passed by
+-- reference and the entry points mutate the state they get, so every scenario builds its own.
+-- ---------------------------------------------------------------------------------------
+
+let SELLER be "0x1111111111111111111111111111111111111111"
+let ANA be "0x2222222222222222222222222222222222222222"
+let BOB be "0x3333333333333333333333333333333333333333"
+let CARL be "0x4444444444444444444444444444444444444444"
+let TST be "0xa0b86991c6218b36c1d19d4a2e9eb0ce3606eb48"
+let ID1 be "0x00000000000000000000000000000001"
+
+task dep(state, who, token, amount)
+    give deposit({"app_id": 1, "sender": who, "token": token, "value": amount, "value_hex": "0x0", "state": state})["state"]
+
+task send(state, sender, payload)
+    give process({"app_id": 1, "sender": sender, "request_type": 1, "kind": "process", "payload": payload, "payload_hex": nothing, "state": state})
+
+-- the seller holds 1000 TST (6 decimals); Ana, Bob and Carl hold 2 ETH each
+task funded()
+    let s be deploy({"app_id": 1, "kind": "deploy", "params": nothing})["state"]
+    set s to dep(s, SELLER, TST, "1000000000")
+    set s to dep(s, ANA, ETH, "2000000000000000000")
+    set s to dep(s, BOB, ETH, "2000000000000000000")
+    set s to dep(s, CARL, ETH, "2000000000000000000")
+    give s
+
+-- 1000 TST for ETH, reserve 0.5 ETH for the lot, uniform price
+task opened(kind)
+    give send(funded(), SELLER, {"type": "open", "asset": TST, "quantity": "1000000000", "payment": ETH, "reserve": "500000000000000000", "kind": kind})["state"]
+
+-- Ana: 600 TST for 0.9 ETH (0.0015/TST) · Bob: 600 TST for 0.6 ETH (0.001/TST) · Carl: 100 TST for 0.01 ETH (below the reserve)
+task with_bids(kind)
+    let s be opened(kind)
+    set s to send(s, ANA, {"type": "bid", "auction": ID1, "quantity": "600000000", "total": "900000000000000000"})["state"]
+    set s to send(s, BOB, {"type": "bid", "auction": ID1, "quantity": "600000000", "total": "600000000000000000"})["state"]
+    set s to send(s, CARL, {"type": "bid", "auction": ID1, "quantity": "100000000", "total": "10000000000000000"})["state"]
+    give s
+
+test "exact integer division of numbers far beyond a float"
+    assert_eq(div_floor(600000000 * 600000000000000000, 600000000), 600000000000000000)
+    assert_eq(div_floor(123456789012345678901234567890, 7), 17636684144620811271604938270)
+    assert_eq(div_floor(10, 3), 3)
+    assert_eq(div_floor(2, 3), 0)
+    assert_eq(div_floor(0, 5), 0)
+    assert_eq(text(int_of("115792089237316195423570985008687907853269984665640564039457584007913129639935")), "115792089237316195423570985008687907853269984665640564039457584007913129639935")
+
+test "deposits are per token; opening locks the asset and announces the auction"
+    let s be funded()
+    assert_eq(balance_of(s, SELLER, TST), 1000000000)
+    assert_eq(balance_of(s, ANA, ETH), 2000000000000000000)
+    let r be send(funded(), SELLER, {"type": "open", "asset": TST, "quantity": "1000000000", "payment": ETH, "reserve": "500000000000000000"})
+    assert_eq(r["state"]["auctions"][ID1]["status"], "open")
+    assert_eq(r["state"]["auctions"][ID1]["kind"], "uniform")
+    assert_eq(balance_of(r["state"], SELLER, TST), 0)
+    assert_eq(r["app_events"][0]["subtype"], "opened")
+    let d be abi_decode("(bytes16,address,uint256,address,uint8)", hex_bytes(r["app_events"][0]["data_hex"]))
+    assert_eq(hex_of(d[0]), ID1)
+    assert_eq(lower(d[1]), TST)
+    assert_eq(text(d[2]), "1000000000")
+    assert_eq(d[4], 0)
+    assert(starts_with(send(funded(), SELLER, {"type": "open", "asset": TST, "quantity": "5000000000", "payment": ETH})["error"], "the seller holds"))
+    assert(starts_with(send(funded(), SELLER, {"type": "open", "asset": TST, "quantity": "1", "payment": TST})["error"], "the asset and the payment"))
+    assert(starts_with(send(funded(), SELLER, {"type": "open", "asset": TST, "quantity": "1", "payment": ETH, "kind": "dutch"})["error"], "kind must be"))
+
+test "a bid escrows the payment; a new bid replaces the old; the seller cannot bid"
+    let s be send(opened("uniform"), ANA, {"type": "bid", "auction": ID1, "quantity": "600000000", "total": "900000000000000000"})
+    assert_eq(balance_of(s["state"], ANA, ETH), 1100000000000000000)
+    assert_eq(s["state"]["auctions"][ID1]["bids"][ANA]["total"], "900000000000000000")
+    assert_eq(s["events"][0]["data"]["type"], "bid")
+    let again be send(s["state"], ANA, {"type": "bid", "auction": ID1, "quantity": "500000000", "total": "800000000000000000"})
+    assert_eq(balance_of(again["state"], ANA, ETH), 1200000000000000000)
+    assert_eq(again["state"]["auctions"][ID1]["bids"][ANA]["total"], "800000000000000000")
+    assert_eq(send(opened("uniform"), SELLER, {"type": "bid", "auction": ID1, "quantity": "1", "total": "1"})["error"], "the seller cannot bid")
+    assert(starts_with(send(opened("uniform"), ANA, {"type": "bid", "auction": ID1, "quantity": "600000000", "total": "3000000000000000000"})["error"], "the bidder holds"))
+    assert(starts_with(send(opened("uniform"), ANA, {"type": "bid", "auction": ID1, "quantity": "2000000000", "total": "1"})["error"], "the auction offers"))
+    assert(starts_with(send(opened("uniform"), ANA, {"type": "bid", "auction": "0x00000000000000000000000000000009", "quantity": "1", "total": "1"})["error"], "unknown auction"))
+    let c be send(s["state"], ANA, {"type": "cancel_bid", "auction": ID1})
+    assert_eq(balance_of(c["state"], ANA, ETH), 2000000000000000000)
+    assert(not contains(c["state"]["auctions"][ID1]["bids"], ANA))
+
+test "uniform price: the best bids win, everyone pays the lowest accepted price, the rest is refunded"
+    let r be send(with_bids("uniform"), SELLER, {"type": "close", "auction": ID1})
+    let s be r["state"]
+    -- Ana 600 filled, Bob 400 filled (partial, the clearing bid), Carl below the reserve
+    assert_eq(balance_of(s, ANA, TST), 600000000)
+    assert_eq(balance_of(s, BOB, TST), 400000000)
+    assert_eq(balance_of(s, CARL, TST), 0)
+    -- clearing price = Bob's 0.001 ETH/TST: Ana pays 0.6, Bob pays 0.4, Carl pays nothing
+    assert_eq(balance_of(s, ANA, ETH), 1400000000000000000)
+    assert_eq(balance_of(s, BOB, ETH), 1600000000000000000)
+    assert_eq(balance_of(s, CARL, ETH), 2000000000000000000)
+    assert_eq(balance_of(s, SELLER, ETH), 1000000000000000000)
+    assert_eq(balance_of(s, SELLER, TST), 0)
+    assert_eq(s["auctions"][ID1]["status"], "closed")
+    assert_eq(s["auctions"][ID1]["result"]["sold"], "1000000000")
+    assert_eq(s["auctions"][ID1]["result"]["proceeds"], "1000000000000000000")
+    let d be abi_decode("(bytes16,uint256,uint256,uint8)", hex_bytes(r["app_events"][0]["data_hex"]))
+    assert_eq(text(d[1]), "1000000000")
+    assert_eq(text(d[2]), "1000000000000000000")
+    -- one result per bidder (losing bids stay private: Carl learns only his own), then the seller's summary
+    assert_eq(length(r["events"]), 4)
+    assert_eq(r["events"][0]["user"], ANA)
+    assert_eq(r["events"][0]["data"]["paid"], "600000000000000000")
+    assert_eq(r["events"][2]["user"], CARL)
+    assert_eq(r["events"][2]["data"]["filled"], "0")
+    assert_eq(r["events"][3]["user"], SELLER)
+    assert_eq(length(r["events"][3]["data"]["fills"]), 3)
+
+test "pay-as-bid: each winner pays its own price"
+    let s be send(with_bids("pay_as_bid"), SELLER, {"type": "close", "auction": ID1})["state"]
+    assert_eq(balance_of(s, ANA, ETH), 1100000000000000000)
+    assert_eq(balance_of(s, BOB, ETH), 1600000000000000000)
+    assert_eq(balance_of(s, SELLER, ETH), 1300000000000000000)
+
+test "an unsold remainder goes back to the seller; ties go to the earlier bid; nobody but the seller closes"
+    let s be opened("uniform")
+    set s to send(s, ANA, {"type": "bid", "auction": ID1, "quantity": "300000000", "total": "300000000000000000"})["state"]
+    set s to send(s, BOB, {"type": "bid", "auction": ID1, "quantity": "300000000", "total": "300000000000000000"})["state"]
+    assert_eq(send(s, ANA, {"type": "close", "auction": ID1})["error"], "only the seller closes")
+    let r be send(s, SELLER, {"type": "close", "auction": ID1})
+    assert_eq(balance_of(r["state"], SELLER, TST), 400000000)
+    assert_eq(balance_of(r["state"], ANA, TST), 300000000)
+    assert_eq(balance_of(r["state"], BOB, TST), 300000000)
+    assert_eq(r["state"]["auctions"][ID1]["result"]["fills"][0]["bidder"], ANA)
+    assert(starts_with(send(r["state"], SELLER, {"type": "close", "auction": ID1})["error"], "auction " + ID1 + " is closed"))
+
+test "a cancelled auction refunds every bid and returns the asset"
+    let r be send(with_bids("uniform"), SELLER, {"type": "cancel", "auction": ID1})
+    assert_eq(balance_of(r["state"], SELLER, TST), 1000000000)
+    assert_eq(balance_of(r["state"], ANA, ETH), 2000000000000000000)
+    assert_eq(balance_of(r["state"], BOB, ETH), 2000000000000000000)
+    assert_eq(r["state"]["auctions"][ID1]["status"], "cancelled")
+    assert_eq(length(r["events"]), 4)
+
+test "withdrawals are pull-payments from a balance, per token"
+    let s be send(with_bids("uniform"), SELLER, {"type": "close", "auction": ID1})["state"]
+    let r be send(s, ANA, {"type": "withdraw", "token": TST, "amount": "600000000"})
+    assert_eq(r["withdrawals"], [{"token": TST, "to": ANA, "amount": "600000000"}])
+    assert_eq(balance_of(r["state"], ANA, TST), 0)
+    assert(starts_with(send(r["state"], ANA, {"type": "withdraw", "token": TST, "amount": "1"})["error"], "insufficient balance"))
+
+test "the audit sees the whole book; the chain never did"
+    let s be send(with_bids("uniform"), SELLER, {"type": "close", "auction": ID1})["state"]
+    let all be deanonymize({"app_id": 1, "sender": SELLER, "request_type": 2, "kind": "deanonymize", "payload": {}, "payload_hex": nothing, "state": s})
+    assert_eq(length(keys(all["report"]["auctions"][ID1]["bids"])), 3)
+    let one be deanonymize({"app_id": 1, "sender": SELLER, "request_type": 2, "kind": "deanonymize", "payload": {"report_type": "auction", "auction": ID1}, "payload_hex": nothing, "state": s})
+    assert_eq(one["report"]["result"]["sold"], "1000000000")
+    assert(starts_with(send(s, SELLER, {"type": "mint"})["error"], "unsupported instruction type"))

@@ -1,0 +1,494 @@
+-- vela_lib.syn — Vela's client protocol as a Synsema module: keys, the Executor's cipher, the
+-- privacy seed and subtypes, transactions, deploy, the subgraph, events, the facilitator
+-- (meta-transactions), reports, token amounts. `client/vela_client.syn` (the CLI) and
+-- `agent/agent.syn` (the worker) both `use` it; a module carries no `require` block — the program
+-- that imports it declares the capabilities (see the top of either file).
+--
+-- Everything here was read from Horizen's Go code (vela, vela-common-go, vela-nova, the starter
+-- kit v0.2.0) and verified against the real stack; the docs page is
+-- https://synsema.dev/en/0.6.x/73-vela.
+
+let ETH be "0x0000000000000000000000000000000000000000"
+let PROTOCOL_VERSION be 0
+let PROCESS be 1
+let DEANONYMIZATION be 2
+let ASSOCIATE_KEY be 3
+let SIG_REQUEST_SUBMITTED be "0x" + decode(keccak256("RequestSubmitted(uint64,bytes32,address,address)"), "hex")
+let SIG_DEPLOY_SUBMITTED be "0x" + decode(keccak256("DeployRequestSubmitted(uint64,bytes32,address)"), "hex")
+
+-- ---- small helpers ----
+
+-- Decimal text → exact integer (`number()` is a float and loses digits above 2^53).
+export task int_of(t)
+    let n be 0
+    each ch in split(trim(t), "")
+        set n to n * 10 + floor(number(ch))
+    give n
+
+export task hex_bytes(h)
+    let s be when starts_with(h, "0x") then slice(h, 2, length(h)) otherwise h
+    give bytes(s, "hex")
+
+export task hex_of(b)
+    give "0x" + decode(b, "hex")
+
+export task cfg()
+    give {
+        "rpc": env("VELA_RPC_URL", "http://localhost:8545"),
+        "processor": env("VELA_PROCESSOR", ""),
+        "tee_auth": env("VELA_TEE_AUTHENTICATOR", ""),
+        "authority": env("VELA_AUTHORITY_URL", "http://localhost:8081"),
+        "subgraph": env("VELA_SUBGRAPH_URL", "http://localhost:8000/subgraphs/name/hcce"),
+        "app_id": env("VELA_APP_ID", ""),
+        "max_fee": env("VELA_MAX_FEE", "100"),
+        "token": lower(env("VELA_TOKEN", "")),
+        "trigger": lower(env("VELA_TRIGGER", ""))
+    }
+
+export task need(c, key, hint)
+    when c[key] == ""
+        raise("set " + hint + " in .env")
+    give c[key]
+
+-- ---- keys ----
+
+export task secp_key()
+    give secret("VELA_SECP_KEY")
+
+-- `ecdh_shared_secret` takes the private scalar as bytes: the hex in .env is decoded and sealed.
+export task p521_key()
+    let h be env("VELA_P521_KEY", "")
+    when h == ""
+        raise("set VELA_P521_KEY in .env (run `keys` to make one)")
+    give as_secret(hex_bytes(h), "VELA_P521_KEY")
+
+export task p521_public()
+    let h be env("VELA_P521_PUB", "")
+    when h == ""
+        raise("set VELA_P521_PUB in .env (run `keys` to make one)")
+    let b be hex_bytes(h)
+    when length(b) != 133 or b[0] != 4
+        raise("VELA_P521_PUB must be the uncompressed P-521 public key: 0x04 + X + Y (133 bytes)")
+    give b
+
+export task me()
+    give eth_address(secp_key())
+
+-- The Executor's communication key, published on-chain by the TEE authenticator.
+export task tee_public_key(c)
+    let raw be eth_call(c["rpc"], {"to": need(c, "tee_auth", "VELA_TEE_AUTHENTICATOR"), "data": abi_encode("getPubSecp521r1()", [])})
+    let pub be abi_decode("bytes", raw)[0]
+    when length(pub) != 133
+        raise("the TEE authenticator returned " + text(length(pub)) + " bytes, not a 133-byte P-521 key")
+    give pub
+
+-- ---- the Executor's cipher (pkg/crypto/cipher.go) ----
+
+export task derive_key(private, peer_public)
+    let shared be ecdh_shared_secret(private, peer_public, "P-521")
+    give hkdf_sha256(shared, bytes(""), bytes(""), 32)
+
+export task seal(key, plaintext)
+    let nonce be random_bytes(12)
+    give nonce + aes_gcm_encrypt(key, nonce, plaintext)
+
+export task open(key, blob)
+    when length(blob) < 28
+        raise("ciphertext too short (" + text(length(blob)) + " bytes)")
+    give aes_gcm_decrypt(key, slice(blob, 0, 12), slice(blob, 12, length(blob)))
+
+-- ---- privacy seed and the 50 subtypes (vela-nova cmd/seed.go, vela-common-go/subtypes) ----
+
+export task seed_of(secp)
+    give secp256k1_sign(keccak256("subtype-key-v1"), secp)
+
+export task subtypes(seed)
+    let out be []
+    each i in range(1, 51)
+        set out to append(out, "0x" + hmac_sha256(as_secret(bytes([i]), "subtype-index"), as_secret(seed, "subtype-seed")))
+    give out
+
+-- ---- transactions ----
+
+export task send_tx(c, dest, value, calldata)
+    let url be c["rpc"]
+    let sender be me()
+    let gas be eth_estimate_gas(url, {"from": sender, "to": dest, "value": value, "data": calldata})
+    let fees be eth_fee_history(url)
+    let tx be tx_eip1559({
+        "chain_id": eth_chain_id(url),
+        "nonce": eth_nonce(url, sender),
+        "to": dest,
+        "value": value,
+        "gas": gas + floor(gas / 4),
+        "max_fee": fees["base_fee"] * 2 + fees["priority"] + 1,
+        "max_priority": fees["priority"] + 1,
+        "data": calldata
+    })
+    let sig be secp256k1_sign(tx["digest"], secp_key())
+    let hash be eth_send_raw(url, tx_eip1559_raw(tx, sig))
+    let receipt be eth_wait_receipt(url, hash, 1, 120)
+    when receipt == nothing
+        raise("transaction " + hash + " was not mined within 120 s")
+    when receipt["status"] != 1
+        raise("transaction " + hash + " reverted")
+    give receipt
+
+export task find_log(receipt, signature)
+    each entry in receipt["logs"]
+        when length(entry["topics"]) > 0 and lower(entry["topics"][0]) == signature
+            give entry
+    give nothing
+
+export task request_id_of(receipt)
+    let entry be find_log(receipt, SIG_REQUEST_SUBMITTED)
+    when entry == nothing
+        raise("RequestSubmitted not found in the receipt logs")
+    give lower(entry["topics"][2])
+
+export task deploy_ids_of(receipt)
+    let entry be find_log(receipt, SIG_DEPLOY_SUBMITTED)
+    when entry == nothing
+        raise("DeployRequestSubmitted not found in the receipt logs")
+    let app_id be bytes_to_int(hex_bytes(entry["topics"][1]))
+    give {"app_id": app_id, "request_id": hex_of(slice(entry["data"], 0, 32))}
+
+-- submitRequest(protocolVersion, applicationId, requestType, payload, tokenAddress, assetAmount, maxFeeValue)
+-- payable: ETH requests send assetAmount + maxFeeValue; ERC-20 ones send maxFeeValue and pull the token.
+export task submit(c, request_type, payload, token, asset_amount)
+    let app_id be int_of(need(c, "app_id", "VELA_APP_ID"))
+    let max_fee be int_of(c["max_fee"])
+    let calldata be abi_encode("submitRequest(uint8,uint64,uint8,bytes,address,uint256,uint256)", [PROTOCOL_VERSION, app_id, request_type, payload, token, asset_amount, max_fee])
+    let value be when token == ETH then asset_amount + max_fee otherwise max_fee
+    let receipt be send_tx(c, need(c, "processor", "VELA_PROCESSOR"), value, calldata)
+    give request_id_of(receipt)
+
+-- ERC-20: allow the ProcessorEndpoint to pull `amount` of `token` from us.
+export task approve(c, token, amount)
+    let receipt be send_tx(c, token, 0, abi_encode("approve(address,uint256)", [need(c, "processor", "VELA_PROCESSOR"), amount]))
+    print("approved " + text(amount) + " of " + token + " (tx " + text(receipt["transactionHash"]) + ")")
+
+-- ---- deploy: upload the artifact, then the on-chain descriptor (vela-nova cmd/deployapp.go) ----
+
+export task upload_wasm(c, path)
+    let wasm be read_file_bytes(path)
+    let sha be decode(sha256(wasm), "hex")
+    let m be multipart_encode([{"name": "wasm", "filename": "app.wasm", "bytes": wasm, "content_type": "application/wasm"}])
+    let r be http_post(c["authority"] + "/deploy/upload", m["body"], {"Content-Type": m["content_type"]})
+    when not r["ok"]
+        raise("upload failed: HTTP " + text(r["status"]) + " " + r["body"])
+    let j be r["json"]
+    when j["wasmSha256"] != sha
+        raise("upload hash mismatch: local " + sha + ", authority " + text(j["wasmSha256"]))
+    give j
+
+export task deploy(c, path, params, trigger)
+    let up be upload_wasm(c, path)
+    let descriptor be {"mode": "artifact_ref", "artifactId": up["artifactId"], "wasmSha256": up["wasmSha256"]}
+    when params != nothing
+        set descriptor["constructorParams"] to params
+    let payload be bytes(json_encode(descriptor))
+    let calldata be when trigger == nothing then abi_encode("submitDeployRequest(uint8,bytes)", [PROTOCOL_VERSION, payload]) otherwise abi_encode("submitDeployRequestWithTrigger(uint8,bytes,address)", [PROTOCOL_VERSION, payload, trigger])
+    let receipt be send_tx(c, need(c, "processor", "VELA_PROCESSOR"), int_of(c["max_fee"]), calldata)
+    give deploy_ids_of(receipt)
+
+-- ---- the subgraph ----
+
+export task graphql(c, query, variables)
+    let r be http_post(c["subgraph"], {"query": query, "variables": variables})
+    when not r["ok"]
+        raise("subgraph: HTTP " + text(r["status"]) + " " + r["body"])
+    let j be r["json"]
+    when contains(j, "errors") and j["errors"] != nothing and length(j["errors"]) > 0
+        raise("subgraph: " + json_encode(j["errors"]))
+    give j["data"]
+
+export task completion(c, request_id, is_deploy)
+    let entity be when is_deploy then "deployRequestCompleteds" otherwise "requestCompleteds"
+    let q be "query($id: Bytes!) { " + entity + "(where: { requestId: $id }, first: 1) { applicationId requestId status errorCode errorMessage applicationFees blockNumber } }"
+    let rows be graphql(c, q, {"id": request_id})[entity]
+    when length(rows) == 0
+        give nothing
+    give rows[0]
+
+-- Polls until the Manager finalizes the request on-chain and the subgraph indexes it.
+export task wait_completed(c, request_id, is_deploy)
+    let waited be 0
+    let failures be 0
+    while waited < 240
+        let row be nothing
+        try
+            set row to completion(c, request_id, is_deploy)
+            set failures to 0
+        recover err
+            -- a hosted devnet across the internet drops a call now and then; five in a row is an outage
+            set failures to failures + 1
+            when failures >= 5
+                raise(text(err))
+        when row != nothing
+            when text(row["status"]) != "0"
+                raise("request " + request_id + " failed: error " + text(row["errorCode"]) + " " + text(row["errorMessage"]))
+            give row
+        sleep(2)
+        set waited to waited + 2
+    raise("timeout waiting for " + request_id + " (240 s)")
+
+export task my_events(c, limit)
+    let key be derive_key(p521_key(), tee_public_key(c))
+    let subs be subtypes(seed_of(secp_key()))
+    give fetch_events(c, key, subs, limit)
+
+export task fetch_events(c, key, subs, limit)
+    let q be "query($app: BigInt!, $subs: [Bytes!]!, $n: Int!) { userEvents(where: { applicationId: $app, eventSubType_in: $subs }, orderBy: sortKey, orderDirection: desc, first: $n) { requestId eventSubType encryptedData blockNumber logIndex } }"
+    let rows be graphql(c, q, {"app": need(c, "app_id", "VELA_APP_ID"), "subs": subs, "n": limit})["userEvents"]
+    let out be []
+    each ev in rows
+        let item be {"request_id": ev["requestId"], "block": ev["blockNumber"]}
+        try
+            let plain be decode(open(key, hex_bytes(ev["encryptedData"])))
+            try
+                set item["event"] to json_decode(plain)
+            recover err
+                set item["event"] to plain
+        recover err
+            set item["error"] to err
+        set out to append(out, item)
+    give out
+
+export task app_events(c, limit)
+    let q be "query($app: BigInt!, $n: Int!) { appEvents(where: { applicationId: $app }, orderBy: sortKey, orderDirection: desc, first: $n) { requestId eventSubType data blockNumber logIndex } }"
+    let rows be graphql(c, q, {"app": need(c, "app_id", "VELA_APP_ID"), "n": limit})["appEvents"]
+    let out be []
+    each ev in rows
+        set out to append(out, {"request_id": ev["requestId"], "block": ev["blockNumber"], "subtype": ev["eventSubType"], "label": subtype_label(ev["eventSubType"]), "data": ev["data"]})
+    give out
+
+-- A subtype that is a short ASCII label padded with zeros (the guest's `subtype: "execute_requested"`)
+-- reads back as that label; a hash (an invoice receipt) reads back as `nothing`.
+export task subtype_label(subtype)
+    let b be hex_bytes(subtype)
+    let printable be []
+    let zeros be 0
+    each i in range(length(b))
+        let x be b[i]
+        when x == 0
+            set zeros to zeros + 1
+        otherwise when x >= 32 and x <= 126
+            set printable to append(printable, x)
+    when length(printable) == 0 or length(printable) + zeros != length(b)
+        give nothing
+    give decode(bytes(printable))
+
+-- ---- facilitator (meta-transactions, ProcessorEndpoint.submitRequestFor) ----
+-- The USER signs an EIP-712 RequestAuthorization (domain Vela / version "0" / chainId / the
+-- endpoint) and, for an ERC-20 deposit, an EIP-2612 permit; the FACILITATOR (VELA_SECP_KEY)
+-- submits the transaction, paying gas and the fee (msg.value = maxFeeValue). The request runs
+-- with sender = user. Only ASSOCIATEKEY and PROCESS; the deposit can only be an ERC-20 (permit),
+-- never ETH. The user needs no ETH at all.
+
+export task user_key()
+    give secret("VELA_USER_KEY")
+
+export task user_address()
+    give eth_address(user_key())
+
+-- OpenZeppelin's ECDSA.recover wants v = 27/28; secp256k1_sign gives the recovery id 0/1.
+export task eth_signature(digest, key)
+    let sig be secp256k1_sign(digest, key)
+    give slice(sig, 0, 64) + bytes([sig[64] + 27])
+
+export task authorization_digest(chain_id, processor, user, app_id, request_type, payload, token, asset_amount, nonce, deadline)
+    let domain be {"name": "Vela", "version": "0", "chainId": chain_id, "verifyingContract": processor}
+    let types be {"RequestAuthorization": [
+        {"name": "sender", "type": "address"}, {"name": "protocolVersion", "type": "uint8"},
+        {"name": "applicationId", "type": "uint64"}, {"name": "requestType", "type": "uint8"},
+        {"name": "payloadHash", "type": "bytes32"}, {"name": "tokenAddress", "type": "address"},
+        {"name": "assetAmount", "type": "uint256"}, {"name": "nonce", "type": "uint256"},
+        {"name": "deadline", "type": "uint256"}]}
+    let message be {"sender": user, "protocolVersion": PROTOCOL_VERSION, "applicationId": app_id, "requestType": request_type, "payloadHash": keccak256(payload), "tokenAddress": token, "assetAmount": asset_amount, "nonce": nonce, "deadline": deadline}
+    give eip712_digest(domain, types, "RequestAuthorization", message)
+
+-- EIP-2612 Permit under the token's own domain (name from `name()`, version "1").
+export task permit_digest(chain_id, token, token_name, owner, spender, value, nonce, deadline)
+    let domain be {"name": token_name, "version": "1", "chainId": chain_id, "verifyingContract": token}
+    let types be {"Permit": [
+        {"name": "owner", "type": "address"}, {"name": "spender", "type": "address"},
+        {"name": "value", "type": "uint256"}, {"name": "nonce", "type": "uint256"},
+        {"name": "deadline", "type": "uint256"}]}
+    give eip712_digest(domain, types, "Permit", {"owner": owner, "spender": spender, "value": value, "nonce": nonce, "deadline": deadline})
+
+-- depositPermit = abi.encode(uint8 v, bytes32 r, bytes32 s): 96 bytes.
+export task permit_bytes(signature65)
+    give int_to_bytes(signature65[64], 32) + slice(signature65, 0, 64)
+
+export task call_uint(c, dest, signature, args)
+    give abi_decode("uint256", eth_call(c["rpc"], {"to": dest, "data": abi_encode(signature, args)}))[0]
+
+export task submit_for(c, request_type, payload, token, asset_amount)
+    let user be user_address()
+    let processor be need(c, "processor", "VELA_PROCESSOR")
+    let app_id be int_of(need(c, "app_id", "VELA_APP_ID"))
+    let chain_id be eth_chain_id(c["rpc"])
+    let deadline be floor(now()) + 3600
+    let nonce be call_uint(c, processor, "getFacilitatorNonce(address)", [user])
+    let authorization be eth_signature(authorization_digest(chain_id, processor, user, app_id, request_type, payload, token, asset_amount, nonce, deadline), user_key())
+    let permit be bytes([])
+    when asset_amount > 0
+        when token == ETH
+            raise("a facilitator deposit must be an ERC-20 (permit); ETH cannot be deposited through submitRequestFor")
+        let token_name be abi_decode("string", eth_call(c["rpc"], {"to": token, "data": abi_encode("name()", [])}))[0]
+        let token_nonce be call_uint(c, token, "nonces(address)", [user])
+        set permit to permit_bytes(eth_signature(permit_digest(chain_id, token, token_name, user, processor, asset_amount, token_nonce, deadline), user_key()))
+    let calldata be abi_encode("submitRequestFor(address,uint8,uint64,uint8,bytes,address,uint256,uint256,bytes,bytes)", [user, PROTOCOL_VERSION, app_id, request_type, payload, token, asset_amount, deadline, authorization, permit])
+    let receipt be send_tx(c, processor, int_of(c["max_fee"]), calldata)
+    give request_id_of(receipt)
+
+-- The user's AssociateKey payload: the shared P-521 pair from .env, the seed signed by the USER's key.
+export task register_payload_for(c)
+    let encrypted_seed be seal(derive_key(p521_key(), tee_public_key(c)), seed_of(user_key()))
+    give p521_public() + encrypted_seed
+
+export task events_for(c, limit)
+    let key be derive_key(p521_key(), tee_public_key(c))
+    let subs be subtypes(seed_of(user_key()))
+    give fetch_events(c, key, subs, limit)
+
+-- ---- the deanonymization report, from the authority service (vela-nova app/authority_client.go) ----
+-- GET /nonce → sign keccak256("\x19Ethereum Signed Message:\n" ‖ len ‖ chainId(8) ‖ appId(8) ‖ reportId(32) ‖ nonce(32))
+-- with the secp256k1 key → POST /getreport → the report, encrypted for the requester's P-521 key.
+export task download_report(c, report_id)
+    let id be when contains(report_id, "_") then split(report_id, "_")[1] otherwise report_id
+    let id_hex be when starts_with(id, "0x") then slice(id, 2, length(id)) otherwise id
+    when length(id_hex) != 64
+        raise("a report id is 32 bytes of hex (optionally prefixed by <appId>_), got " + report_id)
+    let app_id be int_of(need(c, "app_id", "VELA_APP_ID"))
+    let chain_id be eth_chain_id(c["rpc"])
+    let n be http_get(c["authority"] + "/nonce")["json"]
+    let msg be int_to_bytes(chain_id, 8) + int_to_bytes(app_id, 8) + bytes(id_hex, "hex") + bytes(n["nonce"], "hex")
+    let prefix be bytes([25]) + bytes("Ethereum Signed Message:\n" + text(length(msg)))
+    let sig be secp256k1_sign(keccak256(prefix + msg), secp_key())
+    let body be {"chain_id": chain_id, "app_id": app_id, "report_id": id_hex, "salt": n["salt"], "nonce": n["nonce"], "timestamp": n["timestamp"], "signature": decode(sig, "hex")}
+    let r be http_post(c["authority"] + "/getreport", body)
+    when not r["ok"]
+        raise("getreport: HTTP " + text(r["status"]) + " " + r["body"])
+    let j be r["json"]
+    -- The plaintext is {applicationId, requestId, reportDataBytes}: the guest's `report`, base64 inside.
+    let envelope be json_decode(decode(open(derive_key(p521_key(), tee_public_key(c)), bytes(j["encryptedReport"], "hex"))))
+    let data be decode(bytes(envelope["reportDataBytes"], "base64"), "utf8_lossy")
+    let report be nothing
+    try
+        set report to json_decode(data)
+    recover err
+        set report to data
+    give {"application_id": j["applicationId"], "report_id": j["reportId"], "authority": j["authority"], "report": report}
+
+-- ---- the AssociateKey payload (133 or 226 bytes) ----
+
+export task register_payload(c)
+    let tee be tee_public_key(c)
+    let encrypted_seed be seal(derive_key(p521_key(), tee), seed_of(secp_key()))
+    when length(encrypted_seed) != 93
+        raise("the encrypted seed must be 93 bytes, got " + text(length(encrypted_seed)))
+    give p521_public() + encrypted_seed
+
+-- ---- tokens: human amounts (by text, never a float), on-chain claims ----
+
+export task app_token(c)
+    give need(c, "token", "VELA_TOKEN")
+
+export task token_decimals(c)
+    give abi_decode("uint8", eth_call(c["rpc"], {"to": app_token(c), "data": abi_encode("decimals()", [])}))[0]
+
+-- "1500.50" with 6 decimals → "1500500000": exact, by text, never a float.
+export task to_units(amount, decimals)
+    let t be trim(text(amount))
+    let parts be split(t, ".")
+    when length(parts) > 2 or length(t) == 0
+        raise("not an amount: " + t)
+    let whole be parts[0]
+    let frac be when length(parts) == 2 then parts[1] otherwise ""
+    when (length(whole) > 0 and not matches(whole, "[0-9]+")) or (length(frac) > 0 and not matches(frac, "[0-9]+"))
+        raise("not an amount: " + t)
+    when length(frac) > decimals
+        raise("amount " + t + " has more than " + text(decimals) + " decimals")
+    let padded be frac
+    while length(padded) < decimals
+        set padded to padded + "0"
+    let digits be whole + padded
+    while length(digits) > 1 and starts_with(digits, "0")
+        set digits to slice(digits, 1, length(digits))
+    when digits == ""
+        give "0"
+    give digits
+
+-- "1500500000" with 6 decimals → "1500.500000"
+export task from_units(units, decimals)
+    let u be text(units)
+    while length(u) <= decimals
+        set u to "0" + u
+    when decimals == 0
+        give u
+    give slice(u, 0, length(u) - decimals) + "." + slice(u, length(u) - decimals, length(u))
+
+export task pending_claim(c, payee)
+    give call_uint(c, need(c, "processor", "VELA_PROCESSOR"), "pendingClaims(address,address)", [app_token(c), payee])
+
+-- The balance of any ERC-20 (or ETH) an address holds on-chain.
+export task token_balance_of(c, token, holder)
+    when token == ETH
+        give eth_balance(c["rpc"], holder)
+    give call_uint(c, token, "balanceOf(address)", [holder])
+
+-- floor(a / b) for integers of any size: `/` goes through a float, this does not.
+export task div_floor(a, b)
+    when b <= 0
+        raise("division by zero")
+    when a < b
+        give 0
+    let r be 0
+    let q be 0
+    each ch in split(text(a), "")
+        set r to r * 10 + floor(number(ch))
+        let k be 0
+        while k < 9 and (k + 1) * b <= r
+            set k to k + 1
+        set r to r - k * b
+        set q to q * 10 + k
+    give q
+
+export task token_balance(c, holder)
+    give call_uint(c, app_token(c), "balanceOf(address)", [holder])
+
+-- ---- the public devnet: a token by command, allowlists by the admin key ----
+
+-- POST https://devnet.synsema.app/token → the VELA_* lines for a .env, with a fresh token.
+export task devnet_env(host)
+    let r be http_post("https://" + host + "/token", {})
+    when not r["ok"]
+        raise("devnet: HTTP " + text(r["status"]) + " " + r["body"])
+    give r["json"]["env"]
+
+-- Writes or replaces KEY=value lines in a .env file (keeps everything else as it is).
+export task env_write(path, values)
+    let lines be when file_exists(path) then split(read_file(path), "\n") otherwise []
+    let seen be {}
+    let out be []
+    each line in lines
+        let key be split(line, "=")[0]
+        when contains(values, key)
+            set out to append(out, key + "=" + text(values[key]))
+            set seen[key] to true
+        otherwise
+            set out to append(out, line)
+    each k in keys(values)
+        when not contains(seen, k)
+            set out to append(out, k + "=" + text(values[k]))
+    write_file(path, join(out, "\n"))
+
+export task allow_token(c, token)
+    let allowlist be lower(env("VELA_TOKEN_ALLOWLIST", "0xCf7Ed3AccA5a467e9e704C703E8D87F634fB0Fc9"))
+    give send_tx(c, allowlist, 0, abi_encode("addAllowedToken(address)", [token]))
+
+export task allow_authority(c, app_id, authority)
+    let registry be lower(env("VELA_DEFAULT_AUTHORITY", "0x5FbDB2315678afecb367f032d93F642f64180aa3"))
+    give send_tx(c, registry, 0, abi_encode("addAllowedAuthority(uint256,address)", [app_id, authority]))

@@ -1,0 +1,9 @@
+# the engine clone scripts/build.sh makes, and its target dir
+.synsema/
+# Horizen's starter kit clone scripts/devnet.sh makes
+.vela-devnet/
+# built modules
+build/
+# keys, addresses and tokens: every client/.env* except the example
+client/.env*
+!client/.env.example
