@@ -56,6 +56,13 @@ export task need(c, key, hint)
 export task secp_key()
     give secret("VELA_SECP_KEY")
 
+-- The admin of the allowlists: on the public devnet the token brings the admin key (Anvil #0, public
+-- there) as VELA_ADMIN_KEY; on a local kit the signing key is the admin itself.
+export task admin_key()
+    when env("VELA_ADMIN_KEY", "") != ""
+        give secret("VELA_ADMIN_KEY")
+    give secp_key()
+
 -- `ecdh_shared_secret` takes the private scalar as bytes: the hex in .env is decoded and sealed.
 export task p521_key()
     let h be env("VELA_P521_KEY", "")
@@ -524,8 +531,8 @@ export task env_write(path, values)
 
 export task allow_token(c, token)
     let allowlist be lower(env("VELA_TOKEN_ALLOWLIST", "0xCf7Ed3AccA5a467e9e704C703E8D87F634fB0Fc9"))
-    give send_tx(c, allowlist, 0, abi_encode("addAllowedToken(address)", [token]))
+    give send_tx_as(c, admin_key(), allowlist, 0, abi_encode("addAllowedToken(address)", [token]))
 
 export task allow_authority(c, app_id, authority)
     let registry be lower(env("VELA_DEFAULT_AUTHORITY", "0x5FbDB2315678afecb367f032d93F642f64180aa3"))
-    give send_tx(c, registry, 0, abi_encode("addAllowedAuthority(uint256,address)", [app_id, authority]))
+    give send_tx_as(c, admin_key(), registry, 0, abi_encode("addAllowedAuthority(uint256,address)", [app_id, authority]))
