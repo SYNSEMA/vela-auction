@@ -340,9 +340,14 @@ task auction_rows(c, s, cleared)
 
 task overview(s, ok, err)
     let c be config(s)
-    let token be v.app_token(c)
-    let d be {"ok": ok, "err": err, "host": v.need(c, "rpc", "VELA_RPC_URL"), "seller": "", "eth": "", "token": token, "symbol": symbol_of(c, token), "token_wallet": "", "claim_eth": "", "claim_token": "",
+    let token be c["token"]
+    let d be {"ok": ok, "err": err, "host": v.need(c, "rpc", "VELA_RPC_URL"), "seller": "", "eth": "", "token": token, "symbol": "", "token_wallet": "", "claim_eth": "", "claim_token": "",
               "app_id": s["app_id"], "deployed": s["app_id"] != "", "auctions": [], "bidders": [], "events": [], "chain": [], "note": ""}
+    -- without the stack's token there is nothing to sell: say so instead of failing
+    when token == ""
+        set d["note"] to "VELA_TOKEN is empty: the environment was not provisioned. Set it (the devnet hands it out as VELA_TEST_TOKEN) and redeploy."
+        give render("pages/home.html", d)
+    set d["symbol"] to symbol_of(c, token)
     try
         set d["seller"] to v.me()
         set d["eth"] to wallet(c, ETH, d["seller"])
