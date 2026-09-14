@@ -56,8 +56,8 @@ export task need(c, key, hint)
 export task secp_key()
     give secret("VELA_SECP_KEY")
 
--- The admin of the allowlists: on the public devnet the token brings the admin key (Anvil #0, public
--- there) as VELA_ADMIN_KEY; on a local kit the signing key is the admin itself.
+-- The key that signs the allowlists when the kit signs them itself: VELA_ADMIN_KEY when the .env
+-- names one (a devnet of your own), else the signing key (a local kit, where it is the admin).
 export task admin_key()
     when env("VELA_ADMIN_KEY", "") != ""
         give secret("VELA_ADMIN_KEY")
@@ -529,10 +529,24 @@ export task env_write(path, values)
             set out to append(out, k + "=" + text(values[k]))
     write_file(path, join(out, "\n"))
 
+-- The allowlists are the admin's. On the public devnet the token brings VELA_ADMIN_URL, the desk
+-- that signs allow-token / allow-authority for you (an auditor only for an app your account
+-- deployed): no admin key leaves the machine. Elsewhere they are signed here, with admin_key().
 export task allow_token(c, token)
+    when env("VELA_ADMIN_URL", "") != ""
+        give allow_at("allow-token", {"address": token})
     let allowlist be lower(env("VELA_TOKEN_ALLOWLIST", "0xCf7Ed3AccA5a467e9e704C703E8D87F634fB0Fc9"))
     give send_tx_as(c, admin_key(), allowlist, 0, abi_encode("addAllowedToken(address)", [token]))
 
 export task allow_authority(c, app_id, authority)
+    when env("VELA_ADMIN_URL", "") != ""
+        give allow_at("allow-authority", {"app_id": text(app_id), "address": authority})
     let registry be lower(env("VELA_DEFAULT_AUTHORITY", "0x5FbDB2315678afecb367f032d93F642f64180aa3"))
     give send_tx_as(c, admin_key(), registry, 0, abi_encode("addAllowedAuthority(uint256,address)", [app_id, authority]))
+
+-- one admin action at the devnet's desk; the answer names the transaction it signed
+export task allow_at(what, body)
+    let r be http_post(env("VELA_ADMIN_URL", "") + "/" + what, body)
+    when not r["ok"]
+        raise("devnet: HTTP " + text(r["status"]) + " " + r["body"])
+    give {"transactionHash": json_decode(r["body"])["tx"]}

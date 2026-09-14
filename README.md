@@ -138,7 +138,7 @@ deposits and withdrawals as token movements, request fees.
   event for an unregistered address fails the request.
 - Both tokens must be on Vela's allowlist (`allow-token` with the admin key on a devnet); ETH always is.
 - Deploying needs `DEPLOYER_ROLE`; the auditor needs `DefaultAuthority.addAllowedAuthority(appId, address)`
-  (`vela_client.syn -- allow-authority <appId> <address>`; on the devnet the admin key comes as `VELA_ADMIN_KEY`).
+  (`vela_client.syn -- allow-authority <appId> <address>`; on the devnet `VELA_ADMIN_URL` signs it for you).
 - Amounts are the token's smallest unit as text inside the enclave; the client converts. Integers
   in Synsema multiply and compare exactly at any size, but `/` goes through a float: the app and
   the client divide with their own long division.

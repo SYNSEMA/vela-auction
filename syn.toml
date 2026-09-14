@@ -6,7 +6,7 @@
 
 name = "Sealed-bid auction on Vela"
 slug = "vela-auction"
-version = "0.2.3"
+version = "0.2.4"
 kind = "web"
 entry = "web.syn"
 engine = "0.6"
@@ -16,7 +16,7 @@ tagline_pt = "Leilão de lance selado no Vela (Horizen) com Synsema: lances cifr
 
 [secrets]
 VELA_SECP_KEY = "the seller's secp256k1 key: signs the transactions and pays the fees (hex). On the public devnet the token comes with an account of its own: a deployer with ETH and test tokens, whose wallet also funds the demo bidders."
-VELA_ADMIN_KEY = "the admin key for allow-token and allow-authority when it is not the signing key: the public devnet hands out Anvil #0 (public there). Empty on a local kit, where the signing key is the admin."
+VELA_ADMIN_KEY = "the admin key when the kit signs allow-token and allow-authority itself (a devnet of your own). Empty on the public devnet, whose admin desk signs them (VELA_ADMIN_URL), and on a local kit, where the signing key is the admin."
 VELA_P521_KEY = "P-521 private key for the encrypted channel with the Executor (hex). Provisioned on the devnet; made by the app itself when empty."
 
 # The public Vela devnet by default: the provision URL hands out a token of your own and fills these

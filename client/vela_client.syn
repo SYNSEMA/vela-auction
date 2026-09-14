@@ -118,7 +118,7 @@ task run_cli(a)
             v.env_write(".env", values)
             each k in keys(values)
                 print(k + "=" + text(values[k]))
-            print("written to .env: a token of your own on " + host + " with an account of its own (ETH, DEPLOYER_ROLE, test tokens) and the admin key for allow-token / allow-authority")
+            print("written to .env: a token of your own on " + host + " with an account of its own (ETH, DEPLOYER_ROLE, test tokens); allow-token / allow-authority go through its admin desk (VELA_ADMIN_URL)")
         is "allow-token"
             let receipt be v.allow_token(c, lower(a[1]))
             print("token " + lower(a[1]) + " allowlisted (tx " + text(receipt["transactionHash"]) + ")")
