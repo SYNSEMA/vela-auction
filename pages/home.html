@@ -1,0 +1,113 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Sealed-bid auction on Vela</title>
+<style>
+{ raw }
+  :root{--ink:#1c1c1a;--dim:#6b6b66;--line:#e6e2d8;--paper:#fbfaf7;--ok:#1f7a4d;--no:#b23a3a;--accent:#2b4c7e}
+  body{margin:0;font:15px/1.5 system-ui,-apple-system,Segoe UI,Roboto,sans-serif;color:var(--ink);background:var(--paper)}
+  main{max-width:1000px;margin:0 auto;padding:28px 16px 60px}
+  h1{font-size:22px;margin:0 0 4px}h2{font-size:15px;letter-spacing:.04em;text-transform:uppercase;color:var(--dim);margin:0 0 10px}
+  .box{background:#fff;border:1px solid var(--line);border-radius:10px;padding:16px 18px;margin:14px 0}
+  .row{display:flex;gap:14px;flex-wrap:wrap}.row>*{flex:1;min-width:260px}
+  .mono{font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;font-size:13px}.dim{color:var(--dim)}.small{font-size:13px}
+  .flash{padding:10px 12px;border-radius:8px;border:1px solid var(--line);margin:0 0 12px}.flash.ok{border-color:#bfe3cf;background:#eef8f2;color:var(--ok)}.flash.err{border-color:#e9c1c1;background:#fbeeee;color:var(--no)}
+  form{margin:0}label{display:block;font-size:13px;color:var(--dim);margin:8px 0 4px}
+  input[type=text],select{width:100%;box-sizing:border-box;padding:8px 10px;border:1px solid var(--line);border-radius:7px;font:inherit;background:#fff}
+  button{padding:9px 14px;border-radius:8px;border:1px solid var(--accent);background:var(--accent);color:#fff;font:inherit;cursor:pointer;margin-top:8px}button.no{background:#fff;color:var(--no);border-color:var(--no)}button:disabled{opacity:.6;cursor:wait}
+  table{width:100%;border-collapse:collapse;font-size:14px}th,td{text-align:left;padding:7px 6px;border-bottom:1px solid var(--line);vertical-align:top}th{font-weight:600;color:var(--dim);font-size:12px;letter-spacing:.04em;text-transform:uppercase}
+  .kv{display:grid;grid-template-columns:max-content 1fr;gap:4px 14px;font-size:14px}.kv b{color:var(--dim);font-weight:500}
+  .inline{display:inline}a{color:var(--accent)}
+{ end }
+</style>
+</head>
+<body>
+<main>
+  <h1>Sealed-bid auction on Vela</h1>
+  <p class="dim small">A seller offers a block of the stack's token for ETH. Bidders send their bids encrypted to the enclave; nobody sees a bid before the close; the matching runs inside; winners and losers are settled from escrow, and the losing bids are never revealed. This console plays every side on a devnet: the seller's desk here, and a desk per bidder it sets up. Every action is one request to the enclave (30 to 60 s).</p>
+  { when ok != "" }<p class="flash ok">{ ok }</p>{ end }
+  { when err != "" }<p class="flash err">{ err }</p>{ end }
+  { when note != "" }<p class="flash err">{ note }</p>{ end }
+
+  <div class="row">
+    <section class="box">
+      <h2>The seller</h2>
+      <div class="kv">
+        <b>Stack</b><span class="mono">{ host }</span>
+        <b>Address</b><span class="mono">{ seller }</span>
+        <b>Wallet</b><span>{ eth } · { token_wallet }</span>
+        <b>Asset</b><span class="mono">{ token }</span>
+        { when deployed }<b>App</b><span class="mono">{ app_id }</span><b>Claimable</b><span>{ claim_eth } · { claim_token }</span>{ end }
+      </div>
+      { when deployed }
+      <form method="post" action="/fund"><label>Deposit the asset to sell ({ symbol })</label><input type="text" name="amount" placeholder="1000" required><button type="submit" data-busy="Depositing…">Deposit</button></form>
+      <form method="post" action="/withdraw"><div class="row"><div><label>Withdraw from the app</label><select name="token"><option value="eth">ETH (proceeds)</option><option value="asset">{ symbol } (unsold)</option></select></div><div><label>Amount</label><input type="text" name="amount" placeholder="1" required></div></div><button type="submit" data-busy="Withdrawing… then claiming">Withdraw and claim</button></form>
+      { end }
+    </section>
+    <section class="box">
+      { when deployed }
+      <h2>Open an auction</h2>
+      <form method="post" action="/open">
+        <div class="row"><div><label>Quantity of { symbol } offered</label><input type="text" name="quantity" placeholder="1000" required></div><div><label>Reserve for the whole lot (ETH)</label><input type="text" name="reserve" placeholder="0.5"></div></div>
+        <label>Price rule</label><select name="kind"><option value="uniform">Uniform: every winner pays the lowest accepted price</option><option value="pay_as_bid">Pay as bid: each winner pays its own</option></select>
+        <button type="submit" data-busy="Opening…">Open</button>
+      </form>
+      { otherwise }
+      <h2>Not deployed yet</h2>
+      <p class="small">The first step embeds <span class="mono">app/app.syn</span> into the release's guest module, deploys it to Vela and registers the seller's key with the enclave.</p>
+      <form method="post" action="/deploy"><button type="submit" data-busy="Deploying… two minutes">Deploy the auction house</button></form>
+      { end }
+    </section>
+  </div>
+
+  { when deployed }
+  <section class="box">
+    <h2>Auctions</h2>
+    <table>
+      <tr><th>#</th><th>Offer</th><th>Reserve</th><th>Rule</th><th>Status</th><th></th></tr>
+      { each a in auctions }<tr><td>{ a.n }</td><td>{ a.quantity } for ETH</td><td>{ a.reserve }</td><td>{ a.kind }</td><td>{ a.status }{ when a.result != "" } · { a.result }{ end }</td><td>{ when a.open }<form method="post" action="/auctions/{ a.n }/close" class="inline"><button type="submit" data-busy="Matching…">Close</button></form> <form method="post" action="/auctions/{ a.n }/cancel" class="inline"><button type="submit" class="no" data-busy="Cancelling…">Cancel</button></form>{ end }</td></tr>{ otherwise }<tr><td colspan="6" class="dim">None yet: deposit the asset, then open one.</td></tr>{ end }
+    </table>
+  </section>
+
+  <div class="row">
+    <section class="box">
+      <h2>Bidders' desks</h2>
+      <table>
+        <tr><th>Who</th><th>Address</th><th>Wallet</th></tr>
+        { each b in bidders }<tr><td><a href="/bidders/{ b.i }">{ b.name }</a></td><td class="mono">{ b.address }</td><td>{ b.eth } · { b.tokens }</td></tr>{ otherwise }<tr><td colspan="3" class="dim">No bidders yet.</td></tr>{ end }
+      </table>
+      <form method="post" action="/bidders">
+        <div class="row"><div><label>Name</label><input type="text" name="name" placeholder="Ana" required></div><div><label>ETH from the seller's wallet</label><input type="text" name="eth" value="2"></div><div><label>ETH deposited in the app</label><input type="text" name="deposit" value="1"></div></div>
+        <button type="submit" data-busy="Setting up… two requests">Set up a bidder</button>
+      </form>
+      <p class="dim small">A bidder's desk is a wallet this console custodies for the demo; it registers and deposits by itself, and its bids are signed with its own key. A bidder with a wallet of their own uses the command-line client and never touches this page.</p>
+    </section>
+    <section class="box">
+      <h2>What the chain sees</h2>
+      <table>
+        <tr><th>Block</th><th>Public event</th></tr>
+        { each e in chain }<tr><td class="mono">{ e.block }</td><td>{ e.line }</td></tr>{ otherwise }<tr><td colspan="2" class="dim">Nothing yet.</td></tr>{ end }
+      </table>
+      <p class="dim small">That an auction opened and what it cleared at. Never who bid what, never a losing bid.</p>
+    </section>
+  </div>
+
+  <section class="box">
+    <h2>The enclave's answers to the seller</h2>
+    <table>
+      <tr><th>Block</th><th>What happened</th></tr>
+      { each e in events }<tr><td class="mono">{ e.block }</td><td>{ e.line }</td></tr>{ otherwise }<tr><td colspan="2" class="dim">Nothing yet.</td></tr>{ end }
+    </table>
+  </section>
+  { end }
+  <p class="dim small">Built with <a href="https://synsema.dev/en/0.6.x/73-vela">Synsema on Vela</a> · the code: <a href="https://github.com/SYNSEMA/vela-auction">SYNSEMA/vela-auction</a></p>
+</main>
+<script>
+{ raw }
+  document.querySelectorAll("form").forEach(function (f) { f.addEventListener("submit", function () { var b = f.querySelector("button[data-busy]"); if (b) { b.textContent = b.dataset.busy; setTimeout(function () { b.disabled = true; }, 0); } }); });
+{ end }
+</script>
+</body>
+</html>

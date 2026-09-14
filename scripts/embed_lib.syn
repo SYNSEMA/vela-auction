@@ -1,0 +1,60 @@
+-- embed_lib.syn — the app slot of a Vela guest module, as a module: `scripts/embed.syn` (the
+-- command) and a kit's web app (which downloads the release's guest and embeds the program at first
+-- deploy) both `use` it. Layout of the slot (524 288 bytes): magic (16) · name length (1) · name (63) ·
+-- program length as u32 little-endian (4) · the program, UTF-8 · padding. Programs up to 524 204 bytes.
+
+let MAGIC be "SYNSEMA.APPSLOT1"
+let SLOT be 524288
+let HEADER be 16 + 1 + 63 + 4
+
+export task u32_le(n)
+    give bytes([n % 256, floor(n / 256) % 256, floor(n / 65536) % 256, floor(n / 16777216) % 256])
+
+export task base_name(path)
+    let parts be split(replace_text(path, "\\", "/"), "/")
+    give parts[length(parts) - 1]
+
+export task slot_offset(wasm)
+    -- the whole module as hex, split on the magic: exactly one slot, byte-aligned
+    let parts be split(decode(wasm, "hex"), decode(bytes(MAGIC), "hex"))
+    when length(parts) < 2
+        raise("no app slot in this module: it needs a guest from Synsema v0.6.23 or newer (the release asset synsema-vela-guest.wasm)")
+    when length(parts) > 2
+        raise("the module has more than one app slot; refusing to guess")
+    when length(parts[0]) % 2 != 0
+        raise("the app slot is not byte-aligned; refusing to guess")
+    give floor(length(parts[0]) / 2)
+
+export task embed(wasm, program, name)
+    let off be slot_offset(wasm)
+    when off + SLOT > length(wasm)
+        raise("the module ends before its app slot does (" + text(length(wasm)) + " bytes)")
+    let body be bytes(program)
+    when length(body) > SLOT - HEADER
+        raise("the program is " + text(length(body)) + " bytes; the app slot holds at most " + text(SLOT - HEADER))
+    let n be bytes(name)
+    when length(n) > 63
+        set n to slice(n, 0, 63)
+    let header be bytes(MAGIC) + bytes([length(n)]) + n + int_to_bytes(0, 63 - length(n)) + u32_le(length(body))
+    let slot be header + body + int_to_bytes(0, SLOT - HEADER - length(body))
+    give slice(wasm, 0, off) + slot + slice(wasm, off + SLOT, length(wasm))
+
+-- The guest module of a Synsema release, downloaded (GitHub answers with a redirect to its object
+-- store; http_bytes brings the exact bytes) and checked against the release's sha256.
+export task release_guest(tag)
+    let base be "https://github.com/kitecosmic/synsema/releases/download/" + tag
+    let want be trim(split(decode(fetch_bytes(base + "/synsema-vela-guest.wasm.sha256", 4)["bytes"]), " ")[0])
+    let r be fetch_bytes(base + "/synsema-vela-guest.wasm", 4)
+    when r["status"] != 200
+        raise("could not download the guest of " + tag + ": HTTP " + text(r["status"]))
+    let got be decode(sha256(r["bytes"]), "hex")
+    when got != want
+        raise("the guest of " + tag + " does not match its sha256 (" + got + " vs " + want + ")")
+    give r["bytes"]
+
+task fetch_bytes(url, hops)
+    let r be http_bytes("GET", url, nothing, nothing, nothing, 180)
+    when (r["status"] == 301 or r["status"] == 302 or r["status"] == 307 or r["status"] == 308) and hops > 0
+        let h be r["headers"]
+        give fetch_bytes(when contains(h, "location") then h["location"] otherwise h["Location"], hops - 1)
+    give r

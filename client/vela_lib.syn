@@ -42,7 +42,8 @@ export task cfg()
         "app_id": env("VELA_APP_ID", ""),
         "max_fee": env("VELA_MAX_FEE", "100"),
         "token": lower(env("VELA_TOKEN", "")),
-        "trigger": lower(env("VELA_TRIGGER", ""))
+        "trigger": lower(env("VELA_TRIGGER", "")),
+        "trigger_factory": lower(env("VELA_TRIGGER_FACTORY", ""))
     }
 
 export task need(c, key, hint)
@@ -111,8 +112,13 @@ export task subtypes(seed)
 -- ---- transactions ----
 
 export task send_tx(c, dest, value, calldata)
+    give send_tx_as(c, secp_key(), dest, value, calldata)
+
+-- the same transaction signed by `key` instead of the .env key: an account the program custodies
+-- (a demo bidder, a person a portal holds keys for) acting for itself, fees and all
+export task send_tx_as(c, key, dest, value, calldata)
     let url be c["rpc"]
-    let sender be me()
+    let sender be eth_address(key)
     let gas be eth_estimate_gas(url, {"from": sender, "to": dest, "value": value, "data": calldata})
     let fees be eth_fee_history(url)
     let tx be tx_eip1559({
@@ -125,7 +131,7 @@ export task send_tx(c, dest, value, calldata)
         "max_priority": fees["priority"] + 1,
         "data": calldata
     })
-    let sig be secp256k1_sign(tx["digest"], secp_key())
+    let sig be secp256k1_sign(tx["digest"], key)
     let hash be eth_send_raw(url, tx_eip1559_raw(tx, sig))
     let receipt be eth_wait_receipt(url, hash, 1, 120)
     when receipt == nothing
@@ -156,11 +162,15 @@ export task deploy_ids_of(receipt)
 -- submitRequest(protocolVersion, applicationId, requestType, payload, tokenAddress, assetAmount, maxFeeValue)
 -- payable: ETH requests send assetAmount + maxFeeValue; ERC-20 ones send maxFeeValue and pull the token.
 export task submit(c, request_type, payload, token, asset_amount)
+    give submit_as(c, secp_key(), request_type, payload, token, asset_amount)
+
+-- a request signed and paid by `key` (see send_tx_as); an ERC-20 deposit needs that account's approve
+export task submit_as(c, key, request_type, payload, token, asset_amount)
     let app_id be int_of(need(c, "app_id", "VELA_APP_ID"))
     let max_fee be int_of(c["max_fee"])
     let calldata be abi_encode("submitRequest(uint8,uint64,uint8,bytes,address,uint256,uint256)", [PROTOCOL_VERSION, app_id, request_type, payload, token, asset_amount, max_fee])
     let value be when token == ETH then asset_amount + max_fee otherwise max_fee
-    let receipt be send_tx(c, need(c, "processor", "VELA_PROCESSOR"), value, calldata)
+    let receipt be send_tx_as(c, key, need(c, "processor", "VELA_PROCESSOR"), value, calldata)
     give request_id_of(receipt)
 
 -- ERC-20: allow the ProcessorEndpoint to pull `amount` of `token` from us.
@@ -171,7 +181,9 @@ export task approve(c, token, amount)
 -- ---- deploy: upload the artifact, then the on-chain descriptor (vela-nova cmd/deployapp.go) ----
 
 export task upload_wasm(c, path)
-    let wasm be read_file_bytes(path)
+    give upload_wasm_bytes(c, read_file_bytes(path))
+
+export task upload_wasm_bytes(c, wasm)
     let sha be decode(sha256(wasm), "hex")
     let m be multipart_encode([{"name": "wasm", "filename": "app.wasm", "bytes": wasm, "content_type": "application/wasm"}])
     let r be http_post(c["authority"] + "/deploy/upload", m["body"], {"Content-Type": m["content_type"]})
@@ -183,7 +195,11 @@ export task upload_wasm(c, path)
     give j
 
 export task deploy(c, path, params, trigger)
-    let up be upload_wasm(c, path)
+    give deploy_bytes(c, read_file_bytes(path), params, trigger)
+
+-- deploy a module already in memory (a web app that embedded the program itself)
+export task deploy_bytes(c, wasm, params, trigger)
+    let up be upload_wasm_bytes(c, wasm)
     let descriptor be {"mode": "artifact_ref", "artifactId": up["artifactId"], "wasmSha256": up["wasmSha256"]}
     when params != nothing
         set descriptor["constructorParams"] to params
@@ -234,8 +250,12 @@ export task wait_completed(c, request_id, is_deploy)
     raise("timeout waiting for " + request_id + " (240 s)")
 
 export task my_events(c, limit)
-    let key be derive_key(p521_key(), tee_public_key(c))
-    let subs be subtypes(seed_of(secp_key()))
+    give events_with(c, p521_key(), secp_key(), limit)
+
+-- the events of the account `secp` signs for, decrypted with the P-521 key `p521`
+export task events_with(c, p521, secp, limit)
+    let key be derive_key(p521, tee_public_key(c))
+    let subs be subtypes(seed_of(secp))
     give fetch_events(c, key, subs, limit)
 
 export task fetch_events(c, key, subs, limit)
@@ -325,33 +345,34 @@ export task call_uint(c, dest, signature, args)
     give abi_decode("uint256", eth_call(c["rpc"], {"to": dest, "data": abi_encode(signature, args)}))[0]
 
 export task submit_for(c, request_type, payload, token, asset_amount)
-    let user be user_address()
+    give submit_for_with(c, user_key(), request_type, payload, token, asset_amount)
+
+-- the same, for the user whose key is given (a secret of hex)
+export task submit_for_with(c, ukey, request_type, payload, token, asset_amount)
+    let user be eth_address(ukey)
     let processor be need(c, "processor", "VELA_PROCESSOR")
     let app_id be int_of(need(c, "app_id", "VELA_APP_ID"))
     let chain_id be eth_chain_id(c["rpc"])
     let deadline be floor(now()) + 3600
     let nonce be call_uint(c, processor, "getFacilitatorNonce(address)", [user])
-    let authorization be eth_signature(authorization_digest(chain_id, processor, user, app_id, request_type, payload, token, asset_amount, nonce, deadline), user_key())
+    let authorization be eth_signature(authorization_digest(chain_id, processor, user, app_id, request_type, payload, token, asset_amount, nonce, deadline), ukey)
     let permit be bytes([])
     when asset_amount > 0
         when token == ETH
             raise("a facilitator deposit must be an ERC-20 (permit); ETH cannot be deposited through submitRequestFor")
         let token_name be abi_decode("string", eth_call(c["rpc"], {"to": token, "data": abi_encode("name()", [])}))[0]
         let token_nonce be call_uint(c, token, "nonces(address)", [user])
-        set permit to permit_bytes(eth_signature(permit_digest(chain_id, token, token_name, user, processor, asset_amount, token_nonce, deadline), user_key()))
+        set permit to permit_bytes(eth_signature(permit_digest(chain_id, token, token_name, user, processor, asset_amount, token_nonce, deadline), ukey))
     let calldata be abi_encode("submitRequestFor(address,uint8,uint64,uint8,bytes,address,uint256,uint256,bytes,bytes)", [user, PROTOCOL_VERSION, app_id, request_type, payload, token, asset_amount, deadline, authorization, permit])
     let receipt be send_tx(c, processor, int_of(c["max_fee"]), calldata)
     give request_id_of(receipt)
 
 -- The user's AssociateKey payload: the shared P-521 pair from .env, the seed signed by the USER's key.
 export task register_payload_for(c)
-    let encrypted_seed be seal(derive_key(p521_key(), tee_public_key(c)), seed_of(user_key()))
-    give p521_public() + encrypted_seed
+    give register_payload_with(c, p521_key(), p521_public(), user_key())
 
 export task events_for(c, limit)
-    let key be derive_key(p521_key(), tee_public_key(c))
-    let subs be subtypes(seed_of(user_key()))
-    give fetch_events(c, key, subs, limit)
+    give events_with(c, p521_key(), user_key(), limit)
 
 -- ---- the deanonymization report, from the authority service (vela-nova app/authority_client.go) ----
 -- GET /nonce → sign keccak256("\x19Ethereum Signed Message:\n" ‖ len ‖ chainId(8) ‖ appId(8) ‖ reportId(32) ‖ nonce(32))
@@ -385,11 +406,27 @@ export task download_report(c, report_id)
 -- ---- the AssociateKey payload (133 or 226 bytes) ----
 
 export task register_payload(c)
+    give register_payload_with(c, p521_key(), p521_public(), secp_key())
+
+-- the same, with the keys given: the P-521 private key (a secret of bytes), its public point (133
+-- bytes) and the secp256k1 key that signs the seed (a secret of hex) — what a web app keeps in state
+export task register_payload_with(c, p521, pub, secp)
     let tee be tee_public_key(c)
-    let encrypted_seed be seal(derive_key(p521_key(), tee), seed_of(secp_key()))
+    let encrypted_seed be seal(derive_key(p521, tee), seed_of(secp))
     when length(encrypted_seed) != 93
         raise("the encrypted seed must be 93 bytes, got " + text(length(encrypted_seed)))
-    give p521_public() + encrypted_seed
+    when length(pub) != 133 or pub[0] != 4
+        raise("the P-521 public key must be the uncompressed point: 0x04 + X + Y (133 bytes)")
+    give pub + encrypted_seed
+
+-- a P-521 private key from its hex, sealed under the label the manifest names
+export task p521_of(hex)
+    give as_secret(hex_bytes(hex), "VELA_P521_KEY")
+
+-- a secp256k1 key from its hex, sealed under a label: "VELA_SECP_KEY" (the account that pays) or
+-- "VELA_USER_KEY" (a user the facilitator signs for)
+export task secp_of(hex, label)
+    give as_secret(hex, label)
 
 -- ---- tokens: human amounts (by text, never a float), on-chain claims ----
 

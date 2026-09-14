@@ -16,16 +16,47 @@ auditor ──audit ──▶ the whole book
 ```
 
 Built on [Vela](https://docs.horizen.io/vela/introduction/), whose Executor runs the app inside a
-TEE and settles every result on-chain, and on the [vela-app](https://github.com/SYNSEMA/vela-app)
-starter kit. Verified end to end against Horizen's starter kit v0.2.0 (the real Executor, the real
-contracts) on the public devnet.
+TEE and settles every result on-chain. The app is **one `.syn` file** with its tests; the module is
+the release's guest with that program in its slot (no compiler); and the side outside the enclave is
+Synsema too: a **web console** (the recipe's entry) and a command-line client on the same library.
+Verified end to end against Horizen's starter kit v0.2.0 (the real Executor, the real contracts) on
+the public devnet.
+
+## The console
+
+Deploy the recipe on [synsema.com](https://synsema.com) — the project's environment is provisioned
+from the public devnet at creation (a token of your own, the addresses, the keys) — or run it
+locally: `synsema serve web.syn` from this folder, with `.env` copied from `.env.example` and filled
+by `cd client && synsema run vela_client.syn -- devnet`. Then, in the browser:
+
+1. **Deploy the auction house.** The console embeds `app/app.syn` into the release's guest module,
+   deploys it to Vela and registers the seller's key with the enclave.
+2. **Deposit the asset** the seller will sell: the stack's token (`VELA_TOKEN`).
+3. **Set up bidders' desks.** On a devnet the console plays every side: a bidder is a wallet it
+   custodies, given some ETH from the seller's wallet; it registers and deposits by itself, and its
+   bids are signed with its own key. The enclave treats it exactly as a bidder with a wallet of
+   their own, who uses the command-line client and never sees this page.
+4. **Open an auction**: a quantity of the token for ETH, a reserve for the whole lot, uniform price
+   or pay-as-bid.
+5. **Bid from each desk.** A quantity and a total; the desk shows the price it means and sends the
+   bid encrypted. Nobody — not the seller, not the other desks — sees it before the close.
+6. **Close.** The matching runs inside. Each desk learns its own result (fill, price paid, refund,
+   the clearing price); the seller learns the fills; the chain learns what cleared.
+7. **Withdraw and claim**: what was won, what came back, the proceeds — pull-payments claimed on-chain
+   from the same button.
+
+Every action is one request to the enclave: 30 to 60 seconds on a devnet. The console's state
+(app id, keys, desks, auctions) lives in `data/auction.json`, a volume on the platform.
 
 ## What you get
 
 ```
+web.syn                      the console: deploy · deposit · desks · open · bid · close · results · withdrawals (the recipe's entry, kind = web)
+pages/                       its two pages: the seller's desk, a bidder's desk
 app/app.syn                  the book, inside the enclave: deploy · deposit · open · bid · cancel_bid · close · cancel · withdraw · deanonymize, with tests
 client/vela_lib.syn          Vela's client protocol as a module (keys, cipher, submit, events, facilitator, reports, token amounts)
 client/vela_client.syn       the seller's, the bidders' and the auditor's commands, on top of the module
+scripts/embed_lib.syn        the app slot of a guest module (what build.sh and the console use to embed the program)
 scripts/erc20/               the test token (TST, 6 decimals, permit) scripts/devnet.sh deploys and allowlists locally
 scripts/build.sh             app/app.syn → build/app.wasm (the release's guest module with your program in its slot) + sha256
 scripts/embed.syn            puts a .syn into the app slot of a guest module — what build.sh runs; no compiler
@@ -33,7 +64,7 @@ scripts/smoke.mjs            probe of the module under Node's WASI, the way the 
 scripts/devnet.sh            Horizen's starter kit in Docker + the test token; client/.env written
 scripts/e2e.sh               a whole auction: deploy → three parties → open → two sealed bids → close → results → claims → audit
 .github/workflows/build.yml  CI: tests, build, Node 24 + wasmtime-go probes, build/app.wasm as an artifact
-syn.toml                     the recipe descriptor for the Synsema platform
+syn.toml                     the recipe descriptor: the console as entry, the public devnet as default, [provision] for the token
 ```
 
 ## How the matching works
@@ -52,7 +83,7 @@ syn.toml                     the recipe descriptor for the Synsema platform
 - One live bid per bidder per auction; a new one replaces the old; `cancel-bid` before the close.
   The seller can `cancel` an open auction: every bid is refunded.
 
-## Ten minutes
+## Ten minutes, from the terminal
 
 You need the [`synsema` binary](https://synsema.org) (`npm i -g synsema`, or the install script). That is
 all: the module is the release's guest with your program in its slot — no compiler, a few seconds.
@@ -122,8 +153,11 @@ adapter lives in [kitecosmic/synsema — packages/guests/vela](https://github.co
 Subasta de sobre cerrado: la parte vendedora ofrece un bloque de un token a cambio de otro; las
 pujas van cifradas al enclave y nadie las ve antes del cierre; el matching corre adentro (precio
 uniforme o pay-as-bid, ranking exacto por multiplicación cruzada); la liquidación sale del escrow y
-las pujas perdedoras no se revelan nunca. 1. `synsema test app/app.syn`. 2. `sh scripts/build.sh`.
-3. `sh scripts/devnet.sh` (o `synsema run vela_client.syn -- devnet` para el devnet público).
+las pujas perdedoras no se revelan nunca. La consola web (`synsema serve web.syn`, o la receta en
+synsema.com con el entorno aprovisionado desde el devnet público) hace todo desde el navegador: la
+mesa del vendedor y una mesa por postor; desplegar, depositar, abrir, pujar en sobre cerrado, cerrar,
+resultados y retiros reclamados en cadena. Desde la terminal: 1. `synsema test app/app.syn`.
+2. `sh scripts/build.sh`. 3. `sh scripts/devnet.sh` (o `synsema run vela_client.syn -- devnet`).
 4. `sh scripts/e2e.sh`: tres partes, una subasta, dos pujas, cierre, resultados, retiros verificados en
 cadena y auditoría. Referencia completa en [synsema.dev/es/0.6.x/73-vela](https://synsema.dev/es/0.6.x/73-vela).
 

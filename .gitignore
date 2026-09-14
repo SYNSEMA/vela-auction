@@ -7,3 +7,7 @@ build/
 # keys, addresses and tokens: every client/.env* except the example
 client/.env*
 !client/.env.example
+# the console's state and the guest it cached (a volume on the platform); its .env at the root
+/data/
+/.env*
+!/.env.example

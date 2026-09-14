@@ -24,6 +24,7 @@ jobs:
       - name: Test the app and the client natively
         run: |
           synsema test app/app.syn
+          synsema check web.syn
           (cd client && synsema test vela_client.syn)
           synsema test scripts/embed.syn
       - name: Build the guest (the release's module + app/app.syn)
