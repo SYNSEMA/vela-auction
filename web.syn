@@ -93,15 +93,38 @@ task symbol_of(c, token)
 task units(c, token, tokens)
     give v.to_units(tokens, decimals_of(c, token))
 
+-- ---- for people: grouped digits, no trailing zeros, the stack's host ----
+
+task group(intp)
+    let out be ""
+    let i be length(intp)
+    while i > 3
+        set out to "," + slice(intp, i - 3, i) + out
+        set i to i - 3
+    give slice(intp, 0, i) + out
+
+task nice(t)
+    let parts be split(text(t), ".")
+    let dec be when length(parts) > 1 then parts[1] otherwise ""
+    when length(dec) > 6
+        set dec to slice(dec, 0, 6)
+    while length(dec) > 0 and slice(dec, length(dec) - 1, length(dec)) == "0"
+        set dec to slice(dec, 0, length(dec) - 1)
+    give group(parts[0]) + (when dec == "" then "" otherwise "." + dec)
+
+task host_of(url)
+    let u be replace_text(replace_text(text(url), "https://", ""), "http://", "")
+    give split(u, "/")[0]
+
 task human(c, token, u)
-    give v.from_units(text(u), decimals_of(c, token)) + " " + symbol_of(c, token)
+    give nice(v.from_units(text(u), decimals_of(c, token))) + " " + symbol_of(c, token)
 
 -- the price a (quantity, total) pair means, as payment per whole asset unit: exact, then formatted
 task price_of(c, asset, payment, quantity, total)
     when v.int_of(text(quantity)) == 0
         give "-"
     let scaled be v.int_of(text(total)) * v.int_of(v.to_units("1", decimals_of(c, asset)))
-    give v.from_units(text(v.div_floor(scaled, v.int_of(text(quantity)))), decimals_of(c, payment)) + " " + symbol_of(c, payment) + " per " + symbol_of(c, asset)
+    give nice(v.from_units(text(v.div_floor(scaled, v.int_of(text(quantity)))), decimals_of(c, payment))) + " " + symbol_of(c, payment) + " per " + symbol_of(c, asset)
 
 task token_of(c, name)
     give when lower(name) == "eth" then ETH otherwise v.app_token(c)
@@ -208,7 +231,7 @@ task lines_of(c, s, keys, secp, limit)
 task wallet(c, token, holder)
     try
         when token == ETH
-            give v.from_units(text(eth_balance(c["rpc"], holder)), 18) + " ETH"
+            give nice(v.from_units(text(eth_balance(c["rpc"], holder)), 18)) + " ETH"
         give human(c, token, v.token_balance_of(c, token, holder))
     recover e
         give "?"
@@ -341,7 +364,7 @@ task auction_rows(c, s, cleared)
 task overview(s, ok, err)
     let c be config(s)
     let token be c["token"]
-    let d be {"ok": ok, "err": err, "host": v.need(c, "rpc", "VELA_RPC_URL"), "seller": "", "eth": "", "token": token, "symbol": "", "token_wallet": "", "claim_eth": "", "claim_token": "",
+    let d be {"ok": ok, "err": err, "host": host_of(v.need(c, "rpc", "VELA_RPC_URL")), "seller": "", "seller_short": "", "eth": "", "token": token, "token_short": short(token), "symbol": "", "token_wallet": "", "claim_eth": "", "claim_token": "",
               "app_id": s["app_id"], "deployed": s["app_id"] != "", "auctions": [], "bidders": [], "events": [], "chain": [], "note": ""}
     -- without the stack's token there is nothing to sell: say so instead of failing
     when token == ""
@@ -350,6 +373,7 @@ task overview(s, ok, err)
     set d["symbol"] to symbol_of(c, token)
     try
         set d["seller"] to v.me()
+        set d["seller_short"] to short(d["seller"])
         set d["eth"] to wallet(c, ETH, d["seller"])
         set d["token_wallet"] to wallet(c, token, d["seller"])
     recover e
@@ -381,14 +405,14 @@ task overview(s, ok, err)
         set d["auctions"] to auction_rows(c, s, cleared)
         let i be 0
         each b in s["bidders"]
-            set d["bidders"] to append(d["bidders"], {"i": i, "name": b["name"], "address": b["address"], "eth": wallet(c, ETH, b["address"]), "tokens": wallet(c, token, b["address"])})
+            set d["bidders"] to append(d["bidders"], {"i": i, "name": b["name"], "address": b["address"], "short": short(b["address"]), "eth": wallet(c, ETH, b["address"]), "tokens": wallet(c, token, b["address"])})
             set i to i + 1
     give render("pages/home.html", d)
 
 task bidder_page(s, b, i, ok, err)
     let c be config(s)
     let token be v.app_token(c)
-    let d be {"ok": ok, "err": err, "name": b["name"], "address": b["address"], "i": i, "symbol": symbol_of(c, token), "eth": wallet(c, ETH, b["address"]), "tokens": wallet(c, token, b["address"]),
+    let d be {"ok": ok, "err": err, "name": b["name"], "address": b["address"], "address_short": short(b["address"]), "i": i, "symbol": symbol_of(c, token), "eth": wallet(c, ETH, b["address"]), "tokens": wallet(c, token, b["address"]),
               "claim_eth": claimable(c, ETH, b["address"]), "claim_token": claimable(c, token, b["address"]), "open": [], "events": []}
     each a in reverse(s["auctions"])
         when a["status"] == "open"
